@@ -1,0 +1,584 @@
+package shared
+
+import app.amber.ai.provider.CustomHeader
+import app.amber.ai.provider.CustomBody
+import app.amber.ai.provider.BuiltInTools
+import app.amber.ai.provider.GoogleAuthMode
+import app.amber.ai.provider.GOOGLE_API_KEY_DEFAULT_BASE_URL
+import app.amber.ai.provider.MIMO_API_DEFAULT_BASE_URL
+import app.amber.ai.provider.MIMO_TOKEN_PLAN_DEFAULT_BASE_URL
+import app.amber.ai.provider.Model
+import app.amber.ai.provider.ModelAbility
+import app.amber.ai.provider.Modality
+import app.amber.ai.provider.ModelType
+import app.amber.ai.provider.OpenAIAuthMode
+import app.amber.ai.provider.OpenAIBrand
+import app.amber.ai.provider.ProviderSetting
+import app.amber.ai.provider.hasUsableAuth
+import app.amber.ai.provider.fixedBaseUrl
+import app.amber.ai.core.ReasoningLevel
+import app.amber.core.model.Assistant
+import app.amber.core.settings.DEFAULT_AUTO_MODEL_ID
+import app.amber.core.settings.Settings
+import kotlinx.serialization.json.JsonPrimitive
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
+import kotlin.uuid.Uuid
+
+@OptIn(kotlin.uuid.ExperimentalUuidApi::class)
+class IosSettingsMutationsProviderTest {
+    @Test
+    fun providerDeletionClearsAuxiliaryAndAssistantModelReferences() {
+        val removedChat = Model(modelId = "removed-chat", type = ModelType.CHAT)
+        val removedImage = Model(modelId = "removed-image", type = ModelType.IMAGE)
+        val removedProvider = ProviderSetting.OpenAI(models = listOf(removedChat, removedImage))
+        val survivingChat = Model(modelId = "surviving-chat", type = ModelType.CHAT)
+        val survivingProvider = ProviderSetting.OpenAI(models = listOf(survivingChat))
+        val assistant = Assistant(
+            chatModelId = removedChat.id,
+            imageGenerationModelId = removedImage.id,
+        )
+        val settings = Settings(
+            providers = listOf(removedProvider, survivingProvider),
+            chatModelId = removedChat.id,
+            titleModelId = removedChat.id,
+            suggestionModelId = removedChat.id,
+            ocrModelId = removedChat.id,
+            compressModelId = removedChat.id,
+            imageGenerationModelId = removedImage.id,
+            assistants = listOf(assistant),
+        )
+
+        val updated = IosSettingsMutations.removeProvider(settings, removedProvider.id.toString())
+
+        assertEquals(listOf(survivingProvider), updated.providers)
+        assertEquals(survivingChat.id, updated.chatModelId)
+        assertEquals(DEFAULT_AUTO_MODEL_ID, updated.titleModelId)
+        assertEquals(DEFAULT_AUTO_MODEL_ID, updated.suggestionModelId)
+        assertEquals(DEFAULT_AUTO_MODEL_ID, updated.ocrModelId)
+        assertEquals(DEFAULT_AUTO_MODEL_ID, updated.compressModelId)
+        assertEquals(DEFAULT_AUTO_MODEL_ID, updated.imageGenerationModelId)
+        assertNull(updated.assistants.single().chatModelId)
+        assertNull(updated.assistants.single().imageGenerationModelId)
+    }
+
+    @Test
+    fun providerDeletionProceedsWhenOnlyAnAssistantReferencesTheRemovedModel() {
+        // Only one provider; its sole chat model is referenced by an assistant but
+        // NOT by the top-level chatModelId, and no replacement CHAT model remains.
+        // The assistant reference is resolved by nulling (Assistant.chatModelId is
+        // nullable), so removal must proceed instead of silently no-op'ing.
+        val removedChat = Model(modelId = "removed-chat", type = ModelType.CHAT)
+        val removedProvider = ProviderSetting.OpenAI(models = listOf(removedChat))
+        val assistant = Assistant(chatModelId = removedChat.id)
+        val settings = Settings(
+            providers = listOf(removedProvider),
+            chatModelId = DEFAULT_AUTO_MODEL_ID,
+            assistants = listOf(assistant),
+        )
+
+        val updated = IosSettingsMutations.removeProvider(settings, removedProvider.id.toString())
+
+        assertTrue(updated.providers.isEmpty(), "Provider must be removed even when only an assistant references its model")
+        assertNull(updated.assistants.single().chatModelId)
+        assertEquals(DEFAULT_AUTO_MODEL_ID, updated.chatModelId)
+    }
+
+    @Test
+    fun codexAuthModeDoesNotOverwriteThePersistedEndpoint() {
+        val provider = ProviderSetting.OpenAI(
+            baseUrl = "https://proxy.example/v1",
+            chatCompletionsPath = "/custom/chat",
+            useResponseApi = false,
+        )
+
+        val updated = IosSettingsMutations.setOpenAIAuthMode(
+            settings = Settings(providers = listOf(provider)),
+            providerId = provider.id.toString(),
+            authMode = OpenAIAuthMode.CODEX_OAUTH,
+        ).providers.single() as ProviderSetting.OpenAI
+
+        assertEquals(OpenAIAuthMode.CODEX_OAUTH, updated.authMode)
+        assertEquals("https://proxy.example/v1", updated.baseUrl)
+        assertEquals("/custom/chat", updated.chatCompletionsPath)
+        assertFalse(updated.useResponseApi)
+    }
+
+    @Test
+    fun antigravityAuthModePreservesCustomApiKeyEndpointAcrossRoundTrip() {
+        val customBaseUrl = "https://proxy.example/gemini"
+        val provider = ProviderSetting.Google(
+            apiKey = "test-key",
+            baseUrl = customBaseUrl,
+        )
+        val settings = Settings(providers = listOf(provider))
+
+        val oauth = IosSettingsMutations.setGoogleAuthMode(
+            settings = settings,
+            providerId = provider.id.toString(),
+            authMode = GoogleAuthMode.ANTIGRAVITY_OAUTH,
+        ).providers.single() as ProviderSetting.Google
+        assertEquals(GoogleAuthMode.ANTIGRAVITY_OAUTH, oauth.authMode)
+        assertEquals(customBaseUrl, oauth.baseUrl)
+        assertEquals("test-key", oauth.apiKey)
+        assertTrue(oauth.hasUsableAuth())
+
+        val restored = IosSettingsMutations.setGoogleAuthMode(
+            settings = Settings(providers = listOf(oauth)),
+            providerId = provider.id.toString(),
+            authMode = GoogleAuthMode.API_KEY,
+        ).providers.single() as ProviderSetting.Google
+        assertEquals(GoogleAuthMode.API_KEY, restored.authMode)
+        assertEquals(customBaseUrl, restored.baseUrl)
+        assertEquals("test-key", restored.apiKey)
+        assertTrue(restored.hasUsableAuth())
+    }
+
+    @Test
+    fun leavingLegacyAntigravityFixedEndpointRestoresApiKeyDefault() {
+        val provider = ProviderSetting.Google(
+            apiKey = "test-key",
+            baseUrl = GoogleAuthMode.ANTIGRAVITY_OAUTH.fixedBaseUrl()!!,
+            authMode = GoogleAuthMode.ANTIGRAVITY_OAUTH,
+        )
+
+        val updated = IosSettingsMutations.setGoogleAuthMode(
+            settings = Settings(providers = listOf(provider)),
+            providerId = provider.id.toString(),
+            authMode = GoogleAuthMode.API_KEY,
+        ).providers.single() as ProviderSetting.Google
+
+        assertEquals(GoogleAuthMode.API_KEY, updated.authMode)
+        assertEquals(GOOGLE_API_KEY_DEFAULT_BASE_URL, updated.baseUrl)
+        assertEquals("test-key", updated.apiKey)
+    }
+
+    @Test
+    fun leavingAntigravityKeepsACustomProxyBaseUrl() {
+        val provider = ProviderSetting.Google(
+            baseUrl = "https://proxy.example/gemini",
+            authMode = GoogleAuthMode.ANTIGRAVITY_OAUTH,
+        )
+
+        val updated = IosSettingsMutations.setGoogleAuthMode(
+            settings = Settings(providers = listOf(provider)),
+            providerId = provider.id.toString(),
+            authMode = GoogleAuthMode.API_KEY,
+        ).providers.single() as ProviderSetting.Google
+
+        assertEquals(GoogleAuthMode.API_KEY, updated.authMode)
+        assertEquals("https://proxy.example/gemini", updated.baseUrl)
+    }
+
+    @Test
+    fun setGoogleAuthModeIgnoresNonGoogleProviders() {
+        val provider = ProviderSetting.OpenAI(baseUrl = "https://api.openai.com/v1")
+        val updated = IosSettingsMutations.setGoogleAuthMode(
+            settings = Settings(providers = listOf(provider)),
+            providerId = provider.id.toString(),
+            authMode = GoogleAuthMode.ANTIGRAVITY_OAUTH,
+        ).providers.single()
+
+        assertTrue(updated is ProviderSetting.OpenAI)
+    }
+
+    @Test
+    fun zhipuTokenPlanPinsOfficialCodingBaseUrlAndRestoresBrandDefault() {
+        val provider = ProviderSetting.OpenAI(
+            baseUrl = "https://open.bigmodel.cn/api/paas/v4",
+            brand = OpenAIBrand.ZHIPU,
+        )
+        val settings = Settings(providers = listOf(provider))
+
+        val planned = IosSettingsMutations.setOpenAIAuthMode(
+            settings = settings,
+            providerId = provider.id.toString(),
+            authMode = OpenAIAuthMode.ZHIPU_CODING_PLAN,
+        ).providers.single() as ProviderSetting.OpenAI
+        assertEquals(OpenAIAuthMode.ZHIPU_CODING_PLAN, planned.authMode)
+        assertEquals("https://open.bigmodel.cn/api/coding/paas/v4", planned.baseUrl)
+
+        val restored = IosSettingsMutations.setOpenAIAuthMode(
+            settings = Settings(providers = listOf(planned)),
+            providerId = provider.id.toString(),
+            authMode = OpenAIAuthMode.API_KEY,
+        ).providers.single() as ProviderSetting.OpenAI
+        assertEquals(OpenAIAuthMode.API_KEY, restored.authMode)
+        assertEquals("https://open.bigmodel.cn/api/paas/v4", restored.baseUrl)
+    }
+
+    @Test
+    fun mimoAuthModeRoundTripPinsTokenPlanAndRestoresPublicApiBaseUrl() {
+        val provider = ProviderSetting.OpenAI(
+            apiKey = "tp-preserve",
+            baseUrl = MIMO_API_DEFAULT_BASE_URL,
+            models = listOf(Model(modelId = "mimo-v2.5-pro")),
+            brand = OpenAIBrand.MIMO,
+        )
+        val settings = Settings(providers = listOf(provider))
+
+        val planned = IosSettingsMutations.setOpenAIAuthMode(
+            settings = settings,
+            providerId = provider.id.toString(),
+            authMode = OpenAIAuthMode.MIMO_CODING_PLAN,
+        ).providers.single() as ProviderSetting.OpenAI
+        assertEquals(OpenAIAuthMode.MIMO_CODING_PLAN, planned.authMode)
+        assertEquals(MIMO_TOKEN_PLAN_DEFAULT_BASE_URL, planned.baseUrl)
+
+        val restored = IosSettingsMutations.setOpenAIAuthMode(
+            settings = Settings(providers = listOf(planned)),
+            providerId = provider.id.toString(),
+            authMode = OpenAIAuthMode.API_KEY,
+        ).providers.single() as ProviderSetting.OpenAI
+        assertEquals(OpenAIAuthMode.API_KEY, restored.authMode)
+        assertEquals(MIMO_API_DEFAULT_BASE_URL, restored.baseUrl)
+        assertEquals(provider.apiKey, restored.apiKey)
+        assertEquals(provider.models, restored.models)
+    }
+
+    @Test
+    fun mimoTokenPlanPreservesOfficialRegionalEndpointsAndRestoresPublicApi() {
+        listOf(
+            MIMO_TOKEN_PLAN_DEFAULT_BASE_URL,
+            "https://token-plan-sgp.xiaomimimo.com/v1",
+            "https://token-plan-ams.xiaomimimo.com/v1",
+        ).forEach { endpoint ->
+            val provider = ProviderSetting.OpenAI(
+                baseUrl = endpoint,
+                brand = OpenAIBrand.MIMO,
+            )
+
+            val planned = IosSettingsMutations.setOpenAIAuthMode(
+                settings = Settings(providers = listOf(provider)),
+                providerId = provider.id.toString(),
+                authMode = OpenAIAuthMode.MIMO_CODING_PLAN,
+            ).providers.single() as ProviderSetting.OpenAI
+            assertEquals(endpoint, planned.baseUrl)
+
+            val restored = IosSettingsMutations.setOpenAIAuthMode(
+                settings = Settings(providers = listOf(planned)),
+                providerId = provider.id.toString(),
+                authMode = OpenAIAuthMode.API_KEY,
+            ).providers.single() as ProviderSetting.OpenAI
+            assertEquals(MIMO_API_DEFAULT_BASE_URL, restored.baseUrl)
+        }
+    }
+
+    @Test
+    fun mimoTokenPlanPreservesCustomProxyAcrossAuthModeSwitches() {
+        val proxy = "https://mimo-proxy.example/v1"
+        val provider = ProviderSetting.OpenAI(
+            baseUrl = proxy,
+            brand = OpenAIBrand.MIMO,
+        )
+
+        val planned = IosSettingsMutations.setOpenAIAuthMode(
+            settings = Settings(providers = listOf(provider)),
+            providerId = provider.id.toString(),
+            authMode = OpenAIAuthMode.MIMO_CODING_PLAN,
+        ).providers.single() as ProviderSetting.OpenAI
+        assertEquals(proxy, planned.baseUrl)
+
+        val restored = IosSettingsMutations.setOpenAIAuthMode(
+            settings = Settings(providers = listOf(planned)),
+            providerId = provider.id.toString(),
+            authMode = OpenAIAuthMode.API_KEY,
+        ).providers.single() as ProviderSetting.OpenAI
+        assertEquals(proxy, restored.baseUrl)
+    }
+
+    @Test
+    fun leavingTokenPlanKeepsACustomProxyBaseUrl() {
+        val provider = ProviderSetting.OpenAI(
+            baseUrl = "https://proxy.example/glm-coding/v4",
+            authMode = OpenAIAuthMode.ZHIPU_CODING_PLAN,
+            brand = OpenAIBrand.ZHIPU,
+        )
+
+        val updated = IosSettingsMutations.setOpenAIAuthMode(
+            settings = Settings(providers = listOf(provider)),
+            providerId = provider.id.toString(),
+            authMode = OpenAIAuthMode.API_KEY,
+        ).providers.single() as ProviderSetting.OpenAI
+
+        assertEquals(OpenAIAuthMode.API_KEY, updated.authMode)
+        assertEquals("https://proxy.example/glm-coding/v4", updated.baseUrl)
+    }
+
+    @Test
+    fun codexModelRefreshMergesWithoutDestroyingExistingModelIdentity() {
+        val existingId = Uuid.random()
+        val provider = ProviderSetting.OpenAI(
+            models = listOf(
+                Model(
+                    id = existingId,
+                    modelId = "gpt-5.3-codex",
+                    displayName = "Old display",
+                    customHeaders = listOf(CustomHeader("X-Custom", "kept")),
+                    inputModalities = listOf(Modality.TEXT),
+                    abilities = listOf(ModelAbility.REASONING),
+                    contextWindowTokens = 123_456,
+                ),
+                Model(modelId = "private-model", displayName = "Private model"),
+            ),
+        )
+
+        val updated = IosSettingsMutations.mergeProviderChatModels(
+            settings = Settings(providers = listOf(provider)),
+            providerId = provider.id.toString(),
+            modelIds = listOf(
+                "gpt-5.3-codex" to "GPT 5.3 Codex",
+                "gpt-5.4" to "GPT 5.4",
+            ),
+        ).providers.single()
+
+        assertEquals(3, updated.models.size)
+        assertTrue(updated.models.any { it.modelId == "private-model" })
+        val refreshed = updated.models.single { it.modelId == "gpt-5.3-codex" }
+        assertEquals(existingId, refreshed.id)
+        assertEquals("GPT 5.3 Codex", refreshed.displayName)
+        assertEquals(listOf(Modality.TEXT), refreshed.inputModalities)
+        assertEquals(listOf(ModelAbility.REASONING), refreshed.abilities)
+        assertEquals(123_456, refreshed.contextWindowTokens)
+        assertEquals("kept", refreshed.customHeaders.single().value)
+        val appended = updated.models.single { it.modelId == "gpt-5.4" }
+        assertEquals(listOf(Modality.TEXT, Modality.IMAGE), appended.inputModalities)
+        assertEquals(listOf(ModelAbility.TOOL, ModelAbility.REASONING), appended.abilities)
+        assertNull(appended.contextWindowTokens)
+    }
+
+    @Test
+    fun codexModelReplaceUsesRegistryMetadataForNewModels() {
+        val provider = ProviderSetting.OpenAI()
+        val updated = IosSettingsMutations.updateProviderChatModels(
+            settings = Settings(providers = listOf(provider)),
+            providerId = provider.id.toString(),
+            modelIds = listOf("gpt-5.4" to "GPT 5.4"),
+        ).providers.single()
+
+        val model = updated.models.single()
+        assertEquals(listOf(Modality.TEXT, Modality.IMAGE), model.inputModalities)
+        assertEquals(listOf(ModelAbility.TOOL, ModelAbility.REASONING), model.abilities)
+        assertNull(model.contextWindowTokens)
+    }
+
+    @Test
+    fun modelCatalogReplacementPreservesMatchingModelsAndCleansRemovedReferences() {
+        val existingModel = Model(
+            modelId = "kept-model",
+            displayName = "My model label",
+            id = Uuid.random(),
+            type = ModelType.CHAT,
+            customHeaders = listOf(CustomHeader("X-Model-Key", "keep")),
+            customBodies = listOf(CustomBody("quality", JsonPrimitive("high"))),
+            inputModalities = listOf(Modality.TEXT, Modality.IMAGE),
+            outputModalities = listOf(Modality.TEXT, Modality.AUDIO),
+            abilities = listOf(ModelAbility.TOOL),
+            tools = setOf(BuiltInTools.Search),
+            contextWindowTokens = 123_456,
+        )
+        val removedModel = Model(modelId = "removed-model", type = ModelType.CHAT)
+        val imageModel = Model(modelId = "kept-image", type = ModelType.IMAGE)
+        val provider = ProviderSetting.OpenAI(models = listOf(existingModel, removedModel, imageModel))
+        val settings = Settings(
+            providers = listOf(provider),
+            chatModelId = removedModel.id,
+            titleModelId = removedModel.id,
+            suggestionModelId = removedModel.id,
+            ocrModelId = removedModel.id,
+            compressModelId = removedModel.id,
+            imageGenerationModelId = removedModel.id,
+            assistants = listOf(Assistant(
+                chatModelId = removedModel.id,
+                imageGenerationModelId = removedModel.id,
+            )),
+        )
+
+        val updated = IosSettingsMutations.updateProviderChatModels(
+            settings = settings,
+            providerId = provider.id.toString(),
+            modelIds = listOf(
+                "kept-model" to "Catalog display name",
+                "new-model" to "New model",
+            ),
+        )
+        val updatedProvider = updated.providers.single()
+
+        assertEquals(
+            existingModel.copy(displayName = "Catalog display name"),
+            updatedProvider.models.single { it.modelId == "kept-model" },
+        )
+        assertTrue(updatedProvider.models.contains(imageModel))
+        assertTrue(updatedProvider.models.none { it.id == removedModel.id })
+        assertEquals(existingModel.id, updated.chatModelId)
+        assertEquals(DEFAULT_AUTO_MODEL_ID, updated.titleModelId)
+        assertEquals(DEFAULT_AUTO_MODEL_ID, updated.suggestionModelId)
+        assertEquals(DEFAULT_AUTO_MODEL_ID, updated.ocrModelId)
+        assertEquals(DEFAULT_AUTO_MODEL_ID, updated.compressModelId)
+        assertEquals(DEFAULT_AUTO_MODEL_ID, updated.imageGenerationModelId)
+        assertNull(updated.assistants.single().chatModelId)
+        assertNull(updated.assistants.single().imageGenerationModelId)
+    }
+
+    @Test
+    fun legacyCodexGpt6ModelsGainReasoningWithoutOverridingLaterOffChoice() {
+        val sol = Model(modelId = "gpt-6-sol", abilities = emptyList())
+        val luna = Model(modelId = "gpt-6-luna", abilities = emptyList())
+        val provider = ProviderSetting.OpenAI(
+            authMode = OpenAIAuthMode.CODEX_OAUTH,
+            models = listOf(sol, luna),
+        )
+        val assistant = Assistant(
+            chatModelId = sol.id,
+            reasoningLevel = ReasoningLevel.OFF,
+            rememberedReasoningLevelsByModelId = mapOf(
+                sol.id.toString() to ReasoningLevel.OFF,
+                luna.id.toString() to ReasoningLevel.OFF,
+            ),
+        )
+        val saved = Settings(
+            providers = listOf(provider),
+            chatModelId = sol.id,
+            assistants = listOf(assistant),
+        )
+
+        val migrated = IosSettingsMutations.migrateLegacyCodexGpt6Reasoning(saved)
+        val models = migrated.providers.single().models
+        assertTrue(models.all { ModelAbility.REASONING in it.abilities })
+        assertEquals(listOf(sol.id, luna.id), models.map { it.id })
+        assertEquals(ReasoningLevel.AUTO, migrated.assistants.single().reasoningLevel)
+        assertEquals(ReasoningLevel.AUTO, migrated.assistants.single().rememberedReasoningLevelsByModelId[luna.id.toString()])
+        assertEquals(ReasoningLevel.MEDIUM, IosSettingsMutations.currentAssistantReasoningLevel(migrated))
+        assertEquals(migrated, IosSettingsMutations.migrateLegacyCodexGpt6Reasoning(migrated))
+
+        val chosenOff = migrated.copy(assistants = listOf(migrated.assistants.single().copy(
+            reasoningLevel = ReasoningLevel.OFF,
+            rememberedReasoningLevelsByModelId = migrated.assistants.single().rememberedReasoningLevelsByModelId +
+                (sol.id.toString() to ReasoningLevel.OFF),
+        )))
+        assertEquals(chosenOff, IosSettingsMutations.migrateLegacyCodexGpt6Reasoning(chosenOff))
+    }
+
+    @Test
+    fun upsertNewModelPersistsInputModalitiesAndKnownAbilities() {
+        val provider = ProviderSetting.OpenAI()
+        val updated = IosSettingsMutations.upsertProviderChatModel(
+            settings = Settings(providers = listOf(provider)),
+            providerId = provider.id.toString(),
+            modelUuid = null,
+            modelId = "gpt-5",
+            displayName = "GPT 5",
+            contextWindowTokens = null,
+            modelType = ModelType.CHAT,
+            inputModalities = listOf(Modality.TEXT, Modality.IMAGE, Modality.VIDEO),
+            headerPairs = emptyList(),
+        ).providers.single().models.single()
+
+        assertEquals(listOf(Modality.TEXT, Modality.IMAGE, Modality.VIDEO), updated.inputModalities)
+        assertEquals(listOf(ModelAbility.TOOL, ModelAbility.REASONING), updated.abilities)
+
+        val legacyId = Uuid.random()
+        val legacyProvider = ProviderSetting.OpenAI(
+            models = listOf(Model(id = legacyId, modelId = "legacy-model"))
+        )
+        val edited = IosSettingsMutations.upsertProviderChatModel(
+            settings = Settings(providers = listOf(legacyProvider)),
+            providerId = legacyProvider.id.toString(),
+            modelUuid = legacyId.toString(),
+            modelId = "gpt-5",
+            displayName = "GPT 5",
+            contextWindowTokens = null,
+            modelType = ModelType.CHAT,
+            inputModalities = listOf(Modality.TEXT),
+            headerPairs = emptyList(),
+        )
+
+        assertEquals(
+            listOf(ModelAbility.TOOL, ModelAbility.REASONING),
+            edited.providers.single().models.single().abilities
+        )
+    }
+
+    @Test
+    fun adoptGrokOAuthCatalogDropsWebIdsAndStampsAbilities() {
+        val keptId = Uuid.random()
+        val webId = Uuid.random()
+        val provider = ProviderSetting.OpenAI(
+            models = listOf(
+                Model(id = keptId, modelId = "custom-keep", displayName = "Keep"),
+                Model(id = webId, modelId = "grok-4.20-fast", displayName = "Web Fast"),
+            ),
+        )
+
+        val updated = IosSettingsMutations.adoptGrokOAuthChatCatalog(
+            settings = Settings(providers = listOf(provider)),
+            providerId = provider.id.toString(),
+            catalog = listOf("grok-4.6" to "Grok 4.6", "grok-4.5" to "Grok 4.5"),
+            dropModelIds = listOf("grok-4.20-fast", "grok-4.20-auto"),
+        ).providers.single()
+
+        assertEquals(setOf("custom-keep", "grok-4.6", "grok-4.5"), updated.models.map { it.modelId }.toSet())
+        assertEquals(keptId, updated.models.single { it.modelId == "custom-keep" }.id)
+        assertTrue(updated.models.none { it.modelId == "grok-4.20-fast" })
+        val grok46 = updated.models.single { it.modelId == "grok-4.6" }
+        assertEquals(listOf(ModelAbility.TOOL, ModelAbility.REASONING), grok46.abilities)
+        assertTrue(updated.models.single { it.modelId == "custom-keep" }.abilities.isEmpty())
+    }
+
+    @Test
+    fun imageModelRefreshPromotesExistingChatModelWithoutLosingIdentityOrMetadata() {
+        val modelId = "gpt-image-2.5"
+        val existingId = Uuid.random()
+        val existing = Model(
+            id = existingId,
+            modelId = modelId,
+            displayName = "我的生图模型",
+            type = ModelType.CHAT,
+            customHeaders = listOf(CustomHeader("X-Image-Key", "keep-me")),
+            customBodies = listOf(CustomBody("quality", JsonPrimitive("high"))),
+            inputModalities = listOf(Modality.TEXT),
+            outputModalities = listOf(Modality.IMAGE),
+            abilities = listOf(ModelAbility.TOOL),
+            tools = setOf(BuiltInTools.ImageGeneration),
+            contextWindowTokens = 8_192,
+        )
+        val provider = ProviderSetting.OpenAI(models = listOf(existing))
+        val settings = Settings(
+            providers = listOf(provider),
+            imageGenerationModelId = existingId,
+        )
+
+        val first = IosSettingsMutations.upsertProviderImageModel(
+            settings = settings,
+            providerId = provider.id.toString(),
+            modelId = modelId,
+            displayName = "自动发现名称",
+        )
+        val firstModel = first.providers.single().models.single()
+
+        assertEquals(ModelType.IMAGE, firstModel.type)
+        assertEquals(existingId, firstModel.id)
+        assertEquals(existing.displayName, firstModel.displayName)
+        assertEquals(existing.customHeaders, firstModel.customHeaders)
+        assertEquals(existing.customBodies, firstModel.customBodies)
+        assertEquals(existing.outputModalities, firstModel.outputModalities)
+        assertEquals(existing.abilities, firstModel.abilities)
+        assertEquals(existing.tools, firstModel.tools)
+        assertEquals(existing.contextWindowTokens, firstModel.contextWindowTokens)
+        assertEquals(existingId, first.imageGenerationModelId)
+
+        val second = IosSettingsMutations.upsertProviderImageModel(
+            settings = first,
+            providerId = provider.id.toString(),
+            modelId = modelId,
+            displayName = "再次刷新名称",
+        )
+        val secondModels = second.providers.single().models.filter { it.modelId == modelId }
+        assertEquals(1, secondModels.size)
+        assertEquals(existingId, secondModels.single().id)
+        assertEquals(existingId, second.imageGenerationModelId)
+    }
+}
