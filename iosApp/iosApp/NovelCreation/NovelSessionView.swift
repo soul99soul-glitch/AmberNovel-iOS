@@ -1138,6 +1138,9 @@ struct NovelSessionView: View {
             return IOSAppLocalization.string("继续", defaultValue: "继续")
         case .blockingContinuity:
             return IOSAppLocalization.string("处理硬伤", defaultValue: "处理硬伤")
+        case .planProposedForNewBatch:
+            // 与设置页右上角同词：这一步是确认计划/骨架，不是续跑。
+            return IOSAppLocalization.string("确认", defaultValue: "确认")
         default:
             return progress.mustRewriteCandidateOnResume
                 ? IOSAppLocalization.string("重写", defaultValue: "重写")

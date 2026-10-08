@@ -18,6 +18,10 @@ enum NovelPromptKind: String, Codable, CaseIterable, Sendable {
     case chapterAdjudicationV1
     case chapterPlanProposalV1
     case workspacePlotV1
+    case chapterPacingV1
+    case batchSkeletonV1
+    case batchSkeletonReviewV1
+    case volumePlanV1
 }
 
 struct NovelPromptTemplate: Codable, Equatable, Sendable {
@@ -104,15 +108,20 @@ enum NovelPromptCatalog {
             versions.formUnion([
                 "novel.chapter-plan-proposal.v2",
                 "novel.chapter-plan-proposal.v3",
+                // v4 shipped before the 2026-10-07 state-change-and-cost first mustHappen (v5).
+                "novel.chapter-plan-proposal.v4",
             ])
         case .characterProposal, .discussionArchiveV1, .polishDriftV1, .continuityAuditV1,
-             .continuityRepairV1, .chapterPlanAcceptanceV1, .workspacePlotV1:
+             .continuityRepairV1, .chapterPlanAcceptanceV1, .workspacePlotV1,
+             .chapterPacingV1, .batchSkeletonV1, .batchSkeletonReviewV1, .volumePlanV1:
             break
         case .chapterAdjudicationV1:
             // v1 is the shipped four-field adjudication contract. Keep it
             // readable for historical receipts after adding the optional v2
             // next-plan field.
             versions.insert("novel.chapter-adjudication.v1")
+            // v2 shipped before the 2026-10-07 nextPlan state-change rule (v3).
+            versions.insert("novel.chapter-adjudication.v2")
         }
         return versions
     }
@@ -554,7 +563,7 @@ enum NovelPromptCatalog {
         case .chapterAdjudicationV1:
             NovelPromptTemplate(
                 kind: kind,
-                version: "novel.chapter-adjudication.v2",
+                version: "novel.chapter-adjudication.v3",
                 systemText: """
                 Perform the final structured review of one whole-chapter prose candidate before collection.
                 The AUTHORITATIVE CONTEXT contains the confirmed chapter plan, recent written beats, upcoming
@@ -573,7 +582,10 @@ enum NovelPromptCatalog {
                 The PREPARE NEXT CHAPTER PLAN flag and bounded next-plan context are advisory planning inputs.
                 When the flag is true, return a nextPlan object whenever the supplied context supports a coherent
                 next chapter; when the flag is false, return nextPlan as null. If there is not enough information
-                for a safe proposal, return null. A missing nextPlan is also accepted as a host fallback and must
+                for a safe proposal, return null. A nextPlan's first mustHappen states the chapter-end change of
+                situation and its cost (whose situation differs from the previous chapter, and what it costs);
+                "finish a routine task" is never a mustHappen by itself. If the next-plan context has BATCH
+                SKELETON LINE FOR THIS CHAPTER, the nextPlan realizes that line. A missing nextPlan is also accepted as a host fallback and must
                 never invalidate the four core review fields. Do not rewrite the candidate or add unknown keys.
                 Return exactly one raw JSON object and no Markdown, code fence, comments, or trailing prose.
 
@@ -584,12 +596,17 @@ enum NovelPromptCatalog {
         case .chapterPlanProposalV1:
             NovelPromptTemplate(
                 kind: kind,
-                version: "novel.chapter-plan-proposal.v4",
+                version: "novel.chapter-plan-proposal.v5",
                 systemText: """
                 Propose the next chapter plan contract for automated ghostwriting.
                 Use the master outline, current story state, upcoming arc notes, and recent written beats.
                 Advance the plot one chapter only. 必发生 has 1 to 3 items: the new changes this
                 chapter must cause, not a shot list and not a restaging of RECENT WRITTEN BEATS.
+                The first 必发生 states the chapter-end change of situation and its cost: whose
+                situation differs from the previous chapter, and what it costs them. "Finish a routine
+                task" (issue grain, audit a ledger, repair gear) is never a 必发生 by itself.
+                If the context has BATCH SKELETON LINE FOR THIS CHAPTER, realize that line: its state
+                change and cost become the first 必发生.
                 If an event is already in recent written beats, omit it from 必发生; mention the
                 consequence in 禁止发生 only when restaging would stall the book.
                 If the context lists ALREADY WRITTEN UPCOMING NOTES, or an upcoming beat says
@@ -640,6 +657,147 @@ enum NovelPromptCatalog {
                 of this chapter. At most 800 characters. Do not ignore the previous summary.
 
                 Use the author's language. If the previous summary is empty, write a self-contained current state.
+                """
+            )
+
+        case .chapterPacingV1:
+            NovelPromptTemplate(
+                kind: kind,
+                version: "novel.chapter-pacing.v1",
+                systemText: """
+                你是小说节奏审稿人，判断一章是否真正推进了局面。只按下面的 Markdown 标题输出，不要 JSON、代码块或前言。
+
+                变化分五条轴，每条 0–3 分（0 没变，1 细微，2 明显，3 重大且不可逆）：
+                事件（外部局面、权位、得失）、关系（信任、敌对、依附）、认知（新信息）、内心（想法、立场、选择）、蓄势（危机逼近、伏笔、压力积累）。
+
+                先对照 RECENT CHANGES（最近几章各自的主要变化），再判断本章：
+                - 新意分只算本章真正新增的变化。若本章唯一的变化与最近某章是同一类（同一种关系动作、同一类公事，只是换了道具或场景），新意分不超过 1，并在「重复」里写明。
+                - 慢章不等于没有新意：节奏慢但有一条轴出现了新的变化，新意分可以是 2。
+                - 例行公事：本章主体是把一件公事办完（发粮、核册、修械、销账等），而且办完后局面不变。
+                - 有 SKELETON LINE 时，判断本章是否落实了它写的状态变化；没有就写 无。
+                - 有 MILESTONES 时，若本章让其中某条真正达成，原样抄写那一条；否则留空。
+
+                # 五轴
+                事件 0-3
+                关系 0-3
+                认知 0-3
+                内心 0-3
+                蓄势 0-3
+
+                # 强度
+                1-5 的一个数字
+
+                # 节奏位
+                铺垫、升级、高潮、余波 之一
+
+                # 主要变化
+                一句话，不超过 40 字：本章结束时与开头相比最主要的不同。
+
+                # 例行公事
+                是 或 否
+
+                # 新意分
+                0-3 的一个数字
+
+                # 重复
+                每行一条「第N章：重复了什么」；没有就留空。
+
+                # 落实骨架
+                是、否 或 无
+
+                # 达成里程碑
+                达成的那条里程碑原文；没有就留空。
+                """
+            )
+
+        case .batchSkeletonV1:
+            NovelPromptTemplate(
+                kind: kind,
+                version: "novel.batch-skeleton.v1",
+                systemText: """
+                为接下来一批代笔章节拟定骨架。只按下面的 Markdown 标题输出，不要 JSON、代码块或前言。
+
+                输入包括：卷规划（卷目标与待达成里程碑）、最近几章的主要变化、未结线索、作者的「往后几章」备注、目标章数 N，可能还有已固定的章节（照抄，不改）和上一轮评审的扣分理由（必须逐条改正）。
+
+                规则：
+                - 恰好 N 章。每章写明本章结束时谁的处境与上一章不同（状态变化），以及付出的代价。不允许「把一件公事办完、局面照旧」的章。
+                - 相邻两章的状态变化不能是同一类；不得重演最近几章已经发生的变化。
+                - 规模随章数伸缩：5 章左右是一个小弧，含 1 个主要转折；10 章左右是两个小弧或一次中点反转，并有一条在本批内回收的副线。
+                - 至少推进一条待达成里程碑；有未结线索时，至少推进或回收其中一条。
+                - 强度 1–2 的连续章节，预计字数之和不得超过 8000 字。高潮可以连续，不设上限。
+                - 作者的「往后几章」备注与卷规划冲突时，以备注为准。
+                - 使用作者的语言。
+
+                # 起点
+                一句话：本批开始时的局面。
+
+                # 终点
+                一句话：本批结束时主冲突的局面，必须与起点不同。
+
+                # 章节
+                每章一个三级标题「### 第k章」（k 从 1 起，按本批顺序），下面固定七行：
+                状态变化：……
+                代价：……
+                线索：推进或回收的线索；没有写 无
+                节奏位：铺垫、升级、高潮、余波 之一
+                强度：1-5
+                预计字数：一个数字
+                钩子：……
+                """
+            )
+
+        case .batchSkeletonReviewV1:
+            NovelPromptTemplate(
+                kind: kind,
+                version: "novel.batch-skeleton-review.v1",
+                systemText: """
+                独立评审一份批次骨架，不要改写骨架。只按下面的 Markdown 标题输出，不要 JSON、代码块或前言。
+
+                硬门槛逐条判断，写「通过」或「不通过：理由」：
+                1. 每章都有明确的状态变化（不是把公事办完、局面照旧）
+                2. 相邻章节的状态变化不是同一类
+                3. 终点与起点不同
+                4. 没有重演 RECENT CHANGES 里已经发生的变化
+                五维各打 1–5 分：推进幅度、代价与风险、新信息、冲突升级、旧线处理（没有未结线索时记 3）。
+
+                # 硬门槛
+                1. 通过
+                2. 通过
+                3. 通过
+                4. 通过
+
+                # 打分
+                推进幅度 1-5
+                代价与风险 1-5
+                新信息 1-5
+                冲突升级 1-5
+                旧线处理 1-5
+
+                # 扣分理由
+                每行一条，指明第几章、问题和改法；全部合格时留空。
+                """
+            )
+
+        case .volumePlanV1:
+            NovelPromptTemplate(
+                kind: kind,
+                version: "novel.volume-plan.v1",
+                systemText: """
+                为长篇小说拟定接下来一卷的卷规划。只按下面的 Markdown 标题输出，不要 JSON、代码块或前言。
+
+                输入包括：总纲、写作要求、当前剧情状态、最近章节的主要变化、未结线索、当前章数，以及作者给出的方向（可能为空；为空时由你根据总纲和已写内容判断下一卷最该推进的主线）。
+
+                规则：
+                - 卷目标写本卷结束时主冲突的局面。
+                - 里程碑 4–6 个，按先后排列。每个都是一件让主线局面不可逆改变的事件，不是场景，也不是公事。
+                - 每个里程碑注明预计在全书第几章前后达成，从当前章数之后开始排，节奏张弛有度。
+                - 不要重复已经写过的事件。使用作者的语言。
+
+                # 卷目标
+                一句话。
+
+                # 里程碑
+                每行一条：「描述（约第N章）」
                 """
             )
         }
@@ -1599,6 +1757,67 @@ enum NovelPromptCatalog {
 
             \(stateRebuildJSONContract)
             """
+        case (.chapterPlanProposalV1, "novel.chapter-plan-proposal.v4"):
+            """
+                Propose the next chapter plan contract for automated ghostwriting.
+                Use the master outline, current story state, upcoming arc notes, and recent written beats.
+                Advance the plot one chapter only. 必发生 has 1 to 3 items: the new changes this
+                chapter must cause, not a shot list and not a restaging of RECENT WRITTEN BEATS.
+                If an event is already in recent written beats, omit it from 必发生; mention the
+                consequence in 禁止发生 only when restaging would stall the book.
+                If the context lists ALREADY WRITTEN UPCOMING NOTES, or an upcoming beat says
+                "第N章" with N less than or equal to CANON CHAPTER COUNT, that beat is already
+                on the branch — skip it and take the next unwritten beat.
+                Prefer forward motion over recap. Do not write blocking, camera, or prop instructions
+                (where they stand, what they put on the stove, identical dialogue).
+                章名 must be a concise evocative chapter title of 1–8 characters
+                (e.g. 两脚羊, 同行, 野宿, 渡河, 千里送京娘). Do not prefix with "第X章" or chapter numbers.
+                Do not use a full sentence. Use the author's language.
+                Return markdown only, with exactly these headings and no JSON, code fences, or preamble:
+
+                # 章名
+                One short title.
+
+                # 目标
+                What this chapter must change.
+
+                # 必发生
+                1-3 bullet lines. New obligations only.
+
+                # 禁止发生
+                Bullet lines, or leave empty.
+
+                # 章末钩子
+                Optional. One short hook, or leave empty.
+
+                # 可见要点
+                Optional bullet lines the POV may know, or leave empty.
+                """
+        case (.chapterAdjudicationV1, "novel.chapter-adjudication.v2"):
+            """
+                Perform the final structured review of one whole-chapter prose candidate before collection.
+                The AUTHORITATIVE CONTEXT contains the confirmed chapter plan, recent written beats, upcoming
+                arc, and current branch state. RECENT MANUSCRIPT FOR CONTINUITY, when supplied, is the only
+                manuscript text you may use for cross-chapter comparison. The candidate is the only text that
+                may produce new state facts.
+
+                Keep the three decisions separate. Plan acceptance is a hard contract gate: mark accepted false
+                only when a must-happen is absent from both the candidate and RECENT WRITTEN BEATS, or when a
+                must-not-happen clearly occurs in the candidate. obviousRepetition is advisory and must not by
+                itself make accepted false. Judge story changes, not props, staging, or wording.
+                Continuity is a hard gate only for a contradiction proven by the supplied manuscript and candidate;
+                do not turn ordinary callbacks, deliberate flashbacks, lies, rumours, or harmless repetition into
+                a blocking issue. State delta records only facts caused or established by the candidate.
+                Every state-delta evidence value must be an exact contiguous substring of the candidate.
+                The PREPARE NEXT CHAPTER PLAN flag and bounded next-plan context are advisory planning inputs.
+                When the flag is true, return a nextPlan object whenever the supplied context supports a coherent
+                next chapter; when the flag is false, return nextPlan as null. If there is not enough information
+                for a safe proposal, return null. A missing nextPlan is also accepted as a host fallback and must
+                never invalidate the four core review fields. Do not rewrite the candidate or add unknown keys.
+                Return exactly one raw JSON object and no Markdown, code fence, comments, or trailing prose.
+
+                \(chapterAdjudicationJSONContract)
+                """
         case (.chapterAdjudicationV1, "novel.chapter-adjudication.v1"):
             """
             Perform the final structured review of one whole-chapter prose candidate before collection.

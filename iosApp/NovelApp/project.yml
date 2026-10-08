@@ -192,6 +192,7 @@ targets:
       - path: ../iosAppTests/IOSNovelProjectToolExecutorTests.swift
       - path: ../iosAppTests/NovelBatchPolishTests.swift
       - path: ../iosAppTests/NovelBranchLifecycleTests.swift
+      - path: ../iosAppTests/NovelChapterPacingTests.swift
       - path: ../iosAppTests/NovelChapterReplacementStateTests.swift
       - path: ../iosAppTests/NovelCharacterIdentityCandidateTests.swift
       - path: ../iosAppTests/NovelCollaborationModeTests.swift

@@ -117,6 +117,8 @@ enum NovelGhostwritePauseReason: String, Codable, Equatable, Sendable {
     case userPaused
     case acceptanceFailed
     case obviousRepetition
+    /// 写后防水检查不过：没有新变化、连续例行公事，或喘息段超出字数预算。
+    case noNewChange
     case blockingContinuity
     case continuityAuditIncomplete
     case collectFailed
@@ -145,6 +147,8 @@ enum NovelGhostwritePauseReason: String, Codable, Equatable, Sendable {
             "没按本章计划写过关。继续将重写本章，不会再验同一篇旧稿。"
         case .obviousRepetition:
             "检测到明显复读。继续将重写本章，避免重复近期节拍。"
+        case .noNewChange:
+            "本章没有推进新的变化（或节奏拖沓）。继续将按检查意见重写本章。"
         case .blockingContinuity:
             "前后情节有严重问题，已暂停自动收录。建议按审稿意见润修或改合同。"
         case .continuityAuditIncomplete:
@@ -199,7 +203,7 @@ enum NovelGhostwritePauseReason: String, Codable, Equatable, Sendable {
     /// 质量失败：继续/自愈时必须产新候选，禁止用同一稿再验。
     var requiresRewriteOnContinue: Bool {
         switch self {
-        case .acceptanceFailed, .obviousRepetition, .blockingContinuity,
+        case .acceptanceFailed, .obviousRepetition, .noNewChange, .blockingContinuity,
              .incompleteCandidate, .planMismatch, .healBudgetExhausted,
              .collectBaseStale:
             return true
@@ -214,7 +218,7 @@ enum NovelGhostwritePauseReason: String, Codable, Equatable, Sendable {
     /// 章内可自动改写（同合同 Tier1）。严重连续性默认不停在自动档空转。
     var allowsAutomaticQualityHeal: Bool {
         switch self {
-        case .acceptanceFailed, .obviousRepetition:
+        case .acceptanceFailed, .obviousRepetition, .noNewChange:
             return true
         default:
             return false
@@ -286,7 +290,10 @@ struct NovelGhostwriteFailureReceipt: Codable, Equatable, Sendable {
                     + continuityNotes.prefix(4).map { "- \(clip($0, 120))" }.joined(separator: "\n")
             )
         }
-        lines.append("上一稿已写好的部分视为已确定，只修正上述不确定处；只有补了会破坏整章因果，才整章重来。")
+        // 防水不过是整章没推进，不能再钉住上一稿去补缺口。
+        if reason != .noNewChange {
+            lines.append("上一稿已写好的部分视为已确定，只修正上述不确定处；只有补了会破坏整章因果，才整章重来。")
+        }
         return clip(lines.joined(separator: "\n\n"), characterLimit)
     }
 
@@ -487,6 +494,12 @@ enum NovelGhostwriteHeal {
         guard let receipt else {
             return "请按本章计划写完整一章正文。"
         }
+        if receipt.reason == .noNewChange {
+            return [
+                "请按本章计划重写完整一章正文。上一稿没有推进新的变化，不要沿用它的情节走向。",
+                receipt.healInstructionBlock(),
+            ].joined(separator: "\n\n")
+        }
         var parts = [
             "请在上一稿基础上按本章计划补全正文。已写好的部分视为已确定，只改审稿指出的缺口；不要从零重写。",
             receipt.healInstructionBlock(),
@@ -545,6 +558,8 @@ struct NovelGhostwriteBatchProgressRecord: Codable, Equatable, Sendable {
     var revisionBriefOverride: String?
     var didThinContractAmendThisChapter: Bool
     var contractAmendments: [NovelGhostwriteContractAmendment]
+    /// 旧 sidecar 没有此键时解码为 nil。
+    var batchSkeleton: NovelGhostwriteBatchSkeleton?
 
     /// 冷启动：把进行中相位收成可继续的暂停/失败态。
     func normalizedForColdStart() -> NovelGhostwriteBatchProgressRecord {
@@ -573,7 +588,8 @@ struct NovelGhostwriteBatchProgressRecord: Codable, Equatable, Sendable {
                 next.pauseReason = .userPaused
             }
             // 已是终态/暂停：仍提示已恢复，避免用户以为进度丢了。
-            if next.shouldContinueSameBatchAfterRestore {
+            // 待确认计划/骨架不会自动续跑，不加「将自动继续」。
+            if next.shouldContinueSameBatchAfterRestore, next.pauseReason != .planProposedForNewBatch {
                 next.detailMessage = Self.mergeDetail(next.detailMessage, recoveryNote)
             }
         }
@@ -674,7 +690,8 @@ struct NovelGhostwriteBatchProgressRecord: Codable, Equatable, Sendable {
             revisionBriefOverride: record.revisionBriefOverride,
             didThinContractAmendThisChapter: record.didThinContractAmendThisChapter,
             contractAmendments: record.contractAmendments,
-            infraRetryCount: 0
+            infraRetryCount: 0,
+            batchSkeleton: record.batchSkeleton
         )
     }
 
@@ -706,7 +723,8 @@ struct NovelGhostwriteBatchProgressRecord: Codable, Equatable, Sendable {
             recentFailureFingerprints: progress.recentFailureFingerprints,
             revisionBriefOverride: progress.revisionBriefOverride,
             didThinContractAmendThisChapter: progress.didThinContractAmendThisChapter,
-            contractAmendments: progress.contractAmendments
+            contractAmendments: progress.contractAmendments,
+            batchSkeleton: progress.batchSkeleton
         )
     }
 
@@ -800,6 +818,8 @@ struct NovelGhostwriteProgress: Equatable, Sendable {
     var contractAmendments: [NovelGhostwriteContractAmendment]
     /// 同步基建已自动重试次数（每次进入 await 同步前可清零或按次累加）。
     var infraRetryCount: Int
+    /// 本批骨架（有卷规划的多章批次）；确认后逐章按骨架行拟计划。
+    var batchSkeleton: NovelGhostwriteBatchSkeleton?
 
     init(
         binding: NovelSessionBinding,
@@ -823,7 +843,8 @@ struct NovelGhostwriteProgress: Equatable, Sendable {
         revisionBriefOverride: String? = nil,
         didThinContractAmendThisChapter: Bool = false,
         contractAmendments: [NovelGhostwriteContractAmendment] = [],
-        infraRetryCount: Int = 0
+        infraRetryCount: Int = 0,
+        batchSkeleton: NovelGhostwriteBatchSkeleton? = nil
     ) {
         self.binding = binding
         self.phase = phase
@@ -849,6 +870,7 @@ struct NovelGhostwriteProgress: Equatable, Sendable {
         self.didThinContractAmendThisChapter = didThinContractAmendThisChapter
         self.contractAmendments = contractAmendments
         self.infraRetryCount = max(0, infraRetryCount)
+        self.batchSkeleton = batchSkeleton
     }
 
     var batchProgressLabel: String {
@@ -961,6 +983,9 @@ struct NovelGhostwriteProgress: Equatable, Sendable {
             case .chapterCompleted:
                 return IOSAppLocalization.string("本章已完成", defaultValue: "本章已完成")
             case .planProposedForNewBatch:
+                if batchSkeleton?.isConfirmed == false {
+                    return IOSAppLocalization.string("已拟定骨架 · 待确认", defaultValue: "已拟定骨架 · 待确认")
+                }
                 return IOSAppLocalization.string("已拟定计划 · 待确认", defaultValue: "已拟定计划 · 待确认")
             case .healBudgetExhausted:
                 return IOSAppLocalization.formatted(
@@ -1052,6 +1077,13 @@ struct NovelGhostwriteProgress: Equatable, Sendable {
                 )
             }
             if pauseReason == .planProposedForNewBatch {
+                if batchSkeleton?.isConfirmed == false {
+                    return IOSAppLocalization.formatted(
+                        "骨架已拟定%@",
+                        defaultValue: "骨架已拟定%@",
+                        arguments: [batchSuffix]
+                    )
+                }
                 return IOSAppLocalization.formatted(
                     "同✓ · 计划已拟定%@",
                     defaultValue: "同✓ · 计划已拟定%@",
@@ -1113,7 +1145,7 @@ struct NovelGhostwriteProgress: Equatable, Sendable {
         switch pauseReason {
         case .batchCompleted, .chapterCompleted, .cancelled, nil:
             return false
-        case .userPaused, .acceptanceFailed, .obviousRepetition, .blockingContinuity,
+        case .userPaused, .acceptanceFailed, .obviousRepetition, .noNewChange, .blockingContinuity,
              .continuityAuditIncomplete, .collectFailed, .collectBaseStale, .syncFailed,
              .incompleteCandidate, .planMismatch, .planProposalFailed,
              .planProposedForNewBatch, .healBudgetExhausted, .infrastructureFailed,
@@ -1132,7 +1164,10 @@ struct NovelGhostwriteProgress: Equatable, Sendable {
     /// 后台到期若把验收失败盖成 `infrastructureFailed`，仍跟回执走，避免同稿再验。
     var mustRewriteCandidateOnResume: Bool {
         if pauseReason?.requiresRewriteOnContinue == true { return true }
-        return lastFailureReceipt?.reason.requiresRewriteOnContinue == true
+        guard let receipt = lastFailureReceipt,
+              receipt.reason.requiresRewriteOnContinue else { return false }
+        // 回执只否决它指向的那篇稿；自愈后新写、尚未判过的稿不陪葬。
+        return candidateID == nil || candidateID == receipt.sourceCandidateID
     }
 
     /// 用户已确认一份与 sidecar 不同的合同：旧稿/旧自愈只属于上一份合同。

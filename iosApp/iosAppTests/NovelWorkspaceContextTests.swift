@@ -191,4 +191,98 @@ final class NovelWorkspaceContextTests: XCTestCase {
         XCTAssertEqual(stateSection.label, NovelWorkspaceContextAssembler.label)
         XCTAssertTrue(stateSection.content.contains("## 当前剧情状态"))
     }
+
+    // MARK: - Native open threads
+
+    /// iOS 原生同步把伏笔落成 `foreshadowing.*` 故事事件；未回收伏笔必须从这些事件折叠出来，
+    /// 不能只读 Android 导入的 passthrough 文件（原生项目里那里永远为空）。
+    func testBriefFoldsNativeForeshadowingEventsIntoOpenThreads() throws {
+        var document = try NovelBranchTestFixtures.documentWithCollectedCandidate(
+            content: "陈桥驿的风先到。"
+        )
+        appendForeshadowingEvents(to: &document, [
+            ("foreshadowing.introduced", "黄袍: 军中有人私藏黄袍"),
+            ("foreshadowing.introduced", "密信: 赵普收到一封无名密信"),
+            ("foreshadowing.advanced", "黄袍: 黄袍被抬进中军帐"),
+            ("foreshadowing.resolved", "密信: 密信出自石守信之手"),
+        ])
+        let branch = document.branches[0]
+        let state = try XCTUnwrap(document.stateSnapshots.first {
+            $0.id == branch.currentStateSnapshotID
+        })
+
+        XCTAssertEqual(
+            NovelWorkspaceContextAssembler.openStoryThreads(document: document, state: state),
+            ["- 黄袍：黄袍被抬进中军帐"]
+        )
+        let brief = NovelWorkspaceContextAssembler.brief(
+            document: document,
+            state: state,
+            branch: branch,
+            characterIdentities: [],
+            includeUnsynchronizedWarning: false
+        )
+        XCTAssertTrue(brief.contains("## 未回收伏笔"))
+        XCTAssertTrue(brief.contains("黄袍被抬进中军帐"))
+        XCTAssertFalse(brief.contains("密信"), "已回收的线不再注入")
+    }
+
+    func testChapterPlanProposalContextCarriesOpenThreads() throws {
+        var document = try NovelBranchTestFixtures.documentWithCollectedCandidate(
+            content: "陈桥驿的风先到。"
+        )
+        appendForeshadowingEvents(to: &document, [
+            ("foreshadowing.introduced", "黄袍: 军中有人私藏黄袍"),
+            ("foreshadowing.introduced", "密信: 赵普收到一封无名密信"),
+            ("foreshadowing.resolved", "密信: 密信出自石守信之手"),
+        ])
+        let context = DefaultNovelCreation.chapterPlanProposalContext(
+            document: document,
+            branch: document.branches[0],
+            nextChapterOrdinal: 2,
+            previousPlanSummary: nil
+        )
+        XCTAssertTrue(context.contains("OPEN THREADS"))
+        XCTAssertTrue(context.contains("军中有人私藏黄袍"))
+        XCTAssertFalse(context.contains("密信"))
+    }
+
+    private func appendForeshadowingEvents(
+        to document: inout NovelProjectDocumentV1,
+        _ events: [(kind: String, summary: String)]
+    ) {
+        guard let index = document.stateSnapshots.firstIndex(where: {
+            $0.id == document.branches[0].currentStateSnapshotID
+        }) else {
+            return XCTFail("fixture must have a current state snapshot")
+        }
+        var sequence = document.events.map(\.sequence).max() ?? -1
+        var newIDs: [NovelEventID] = []
+        for event in events {
+            sequence += 1
+            let record = NovelStoryEventRecord(
+                id: NovelEventID(),
+                sequence: sequence,
+                kind: event.kind,
+                summary: event.summary,
+                entityReferences: [],
+                createdAt: document.project.updatedAt
+            )
+            document.events.append(record)
+            newIDs.append(record.id)
+        }
+        let old = document.stateSnapshots[index]
+        document.stateSnapshots[index] = NovelStateSnapshotRecord(
+            id: old.id,
+            eventIDs: old.eventIDs + newIDs,
+            summary: old.summary,
+            branchOutline: old.branchOutline,
+            unresolvedEntityNames: old.unresolvedEntityNames,
+            createdAt: old.createdAt,
+            settingProposalIDs: old.settingProposalIDs,
+            characterIdentityClarifications: old.characterIdentityClarifications,
+            recentWrittenHighlights: old.recentWrittenHighlights,
+            chapterPlots: old.chapterPlots
+        )
+    }
 }

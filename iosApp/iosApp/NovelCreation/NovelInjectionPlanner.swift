@@ -822,7 +822,8 @@ private extension NovelPromptKind {
         case .quickStart, .characterProposal, .discussion,
              .stateDeltaV1, .manualSyncV1, .discussionArchiveV1, .polishDriftV1,
              .continuityAuditV1, .continuityRepairV1, .chapterPlanAcceptanceV1,
-             .chapterPlanProposalV1, .workspacePlotV1:
+             .chapterPlanProposalV1, .workspacePlotV1, .chapterPacingV1, .batchSkeletonV1,
+             .batchSkeletonReviewV1, .volumePlanV1:
             false
         }
     }
@@ -835,7 +836,7 @@ private extension NovelPromptKind {
             true
         case .quickStart, .characterProposal, .discussion, .stateDeltaV1, .manualSyncV1,
              .discussionArchiveV1, .polishDriftV1, .chapterPlanAcceptanceV1, .chapterPlanProposalV1,
-             .workspacePlotV1:
+             .workspacePlotV1, .chapterPacingV1, .batchSkeletonV1, .batchSkeletonReviewV1, .volumePlanV1:
             false
         }
     }

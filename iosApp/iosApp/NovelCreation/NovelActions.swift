@@ -1821,14 +1821,16 @@ protocol NovelCreation: Sendable {
         projectID: NovelProjectID,
         branchID: NovelBranchID,
         candidateID: NovelCandidateID,
-        prepareNextPlan: Bool
+        prepareNextPlan: Bool,
+        nextPlanSkeletonLine: String?
     ) async throws -> NovelGhostwriteChapterAdjudicationResult
     /// 代笔多章：自动拟定并确认下一章合同（创作模型）。批内第 2～N 章走此路径。
     func proposeAndConfirmNextChapterPlan(
         projectID: NovelProjectID,
         branchID: NovelBranchID,
         nextChapterOrdinal: Int,
-        previousPlanSummary: String?
+        previousPlanSummary: String?,
+        skeletonLine: String?
     ) async throws -> NovelChapterPlanRecord
     /// 首次/无确认计划：根据前文生成草稿本章计划，仍须用户确认。
     func proposeNextChapterPlanDraft(
@@ -1847,6 +1849,15 @@ protocol NovelCreation: Sendable {
         projectID: NovelProjectID,
         branchID: NovelBranchID
     ) async throws
+    /// 代笔节奏类结构化任务（节奏判定、骨架拟定与评审、卷规划拟定），走创作模型策略，不落盘。
+    func executeGhostwritePlanningTask(
+        projectID: NovelProjectID,
+        branchID: NovelBranchID,
+        task: NovelStructuredModelTask
+    ) async throws -> NovelStructuredModelOutput
+    /// 节奏账缓存（派生数据）；默认实现为空，文件仓覆盖。
+    func loadPacingLedger(projectID: NovelProjectID) async throws -> NovelPacingLedgerRecord?
+    func savePacingLedger(_ record: NovelPacingLedgerRecord) async throws
 }
 
 extension NovelCreation {
@@ -1952,6 +1963,23 @@ extension NovelCreation {
         _ = branchID
     }
 
+    func executeGhostwritePlanningTask(
+        projectID: NovelProjectID,
+        branchID: NovelBranchID,
+        task: NovelStructuredModelTask
+    ) async throws -> NovelStructuredModelOutput {
+        throw NovelError.invalidInput("This novel runtime cannot run ghostwrite planning tasks.")
+    }
+
+    func loadPacingLedger(projectID: NovelProjectID) async throws -> NovelPacingLedgerRecord? {
+        _ = projectID
+        return nil
+    }
+
+    func savePacingLedger(_ record: NovelPacingLedgerRecord) async throws {
+        _ = record
+    }
+
     func resumeDetachedGenerationRuns() async {
         // Test doubles and non-live runtimes do not own resumable provider jobs.
     }
@@ -2012,7 +2040,8 @@ extension NovelCreation {
         projectID: NovelProjectID,
         branchID: NovelBranchID,
         candidateID: NovelCandidateID,
-        prepareNextPlan: Bool
+        prepareNextPlan: Bool,
+        nextPlanSkeletonLine: String?
     ) async throws -> NovelGhostwriteChapterAdjudicationResult {
         throw NovelError.invalidInput("This novel runtime cannot adjudicate ghostwritten chapters.")
     }
@@ -2021,7 +2050,8 @@ extension NovelCreation {
         projectID: NovelProjectID,
         branchID: NovelBranchID,
         nextChapterOrdinal: Int,
-        previousPlanSummary: String?
+        previousPlanSummary: String?,
+        skeletonLine: String?
     ) async throws -> NovelChapterPlanRecord {
         throw NovelError.invalidInput("This novel runtime cannot propose chapter plans.")
     }

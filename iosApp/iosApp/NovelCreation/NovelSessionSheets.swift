@@ -1617,9 +1617,14 @@ struct NovelWritingContextSheet: View {
                         LabeledContent("本章计划", value: planStatusLabel)
                         LabeledContent("审稿模型", value: reviewModelLabel)
                         LabeledContent("往后几章", value: upcomingArcStatusLabel)
-                        Text("先确认本章计划，再开始代笔。可在下方「本章计划」一键根据前文生成草稿；多章时后续计划会自动拟定。")
+                        Text(
+                            workspace.currentVolumePlan != nil && ghostwriteDisplayedTargetCount > 1
+                                ? "已有卷规划：多章代笔会先拟定整批骨架交你确认，不必先确认本章计划。"
+                                : "先确认本章计划，再开始代笔。可在下方「本章计划」一键根据前文生成草稿；多章时后续计划会自动拟定。"
+                        )
                             .font(.footnote)
                             .foregroundStyle(AmberTheme.muted)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 } header: {
                     Text("代笔进度")
@@ -1703,7 +1708,7 @@ struct NovelWritingContextSheet: View {
                             Button {
                                 _ = session.continueGhostwriteChapter()
                             } label: {
-                                Text("确认计划，开始写")
+                                Text(isAwaitingSkeletonConfirmation ? "确认骨架，开始写" : "确认计划，开始写")
                                     .lineLimit(1)
                                     .minimumScaleFactor(0.8)
                                     .frame(maxWidth: .infinity, minHeight: 44)
@@ -1794,6 +1799,17 @@ struct NovelWritingContextSheet: View {
                 } footer: {
                     Text(ghostwriteAdvanceSectionFooter)
                         .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if let skeleton = session.ghostwriteProgress?.batchSkeleton {
+                    NovelBatchSkeletonSection(
+                        skeleton: skeleton,
+                        currentOrdinal: session.isGhostwriting
+                            ? (workspace.branchSnapshot?.branch.workingChapterSelections.count).map { $0 + 1 }
+                            : nil,
+                        canRegenerate: session.canStartGhostwriteChapter,
+                        onRegenerate: { _ = session.regenerateGhostwriteSkeleton() }
+                    )
                 }
             }
 
@@ -2014,6 +2030,13 @@ struct NovelWritingContextSheet: View {
                 .fixedSize(horizontal: false, vertical: true)
             }
 
+            if collaborationMode == .ghostwrite {
+                NovelVolumePlanSection(
+                    workspace: workspace,
+                    isEditable: workspace.canMutate && !session.isGhostwriting
+                )
+            }
+
             Section("写作偏好") {
                 Button {
                     applyDraftBeforeTransition(onEditWritingRequirements)
@@ -2094,7 +2117,12 @@ struct NovelWritingContextSheet: View {
             defaultValue: collaborationMode.shortSummary
         )]
         if collaborationMode == .ghostwrite {
-            if session.ghostwriteProgress?.pauseReason == .planProposedForNewBatch {
+            if isAwaitingSkeletonConfirmation {
+                parts.append(IOSAppLocalization.string(
+                    "已拟定本批骨架。确认后整批按骨架自动连写。",
+                    defaultValue: "已拟定本批骨架。确认后整批按骨架自动连写。"
+                ))
+            } else if session.ghostwriteProgress?.pauseReason == .planProposedForNewBatch {
                 parts.append(IOSAppLocalization.string(
                     "已自动拟定下一章计划。确认后开始写，批内后续章节全自动连写。",
                     defaultValue: "已自动拟定下一章计划。确认后开始写，批内后续章节全自动连写。"
@@ -2137,6 +2165,9 @@ struct NovelWritingContextSheet: View {
         }
         // planProposedForNewBatch 优先级在 shouldShowContinueGhostwrite 之前，
         // 与 toolbar 按钮分支顺序一致，避免文案矛盾。
+        if isAwaitingSkeletonConfirmation {
+            return IOSAppLocalization.string("确认骨架后开始写", defaultValue: "确认骨架后开始写")
+        }
         if session.ghostwriteProgress?.pauseReason == .planProposedForNewBatch {
             return IOSAppLocalization.string("确认计划后开始写", defaultValue: "确认计划后开始写")
         }
@@ -2153,7 +2184,23 @@ struct NovelWritingContextSheet: View {
         return IOSAppLocalization.string("开始代笔", defaultValue: "开始代笔")
     }
 
+    /// 与 session 的开批条件一致：有卷规划且本批多于 1 章。
+    private var usesBatchSkeleton: Bool {
+        workspace.currentVolumePlan != nil && ghostwriteDisplayedTargetCount > 1
+    }
+
+    private var isAwaitingSkeletonConfirmation: Bool {
+        session.ghostwriteProgress?.pauseReason == .planProposedForNewBatch
+            && session.ghostwriteProgress?.batchSkeleton?.isConfirmed == false
+    }
+
     private var ghostwriteAdvanceSectionFooter: String {
+        if isAwaitingSkeletonConfirmation {
+            return IOSAppLocalization.string(
+                "骨架见下方。确认后开始写，整批按骨架自动连写；不满意可重新生成。",
+                defaultValue: "骨架见下方。确认后开始写，整批按骨架自动连写；不满意可重新生成。"
+            )
+        }
         if session.ghostwriteProgress?.pauseReason == .planProposedForNewBatch {
             return IOSAppLocalization.string(
                 "已自动拟定下一章计划。确认后开始写本章，批内后续章节全自动连写。",
@@ -2192,6 +2239,12 @@ struct NovelWritingContextSheet: View {
         }
         // 完批后明确告诉用户：上一批已完成，点按钮开始下一批。
         if session.ghostwriteProgress?.pauseReason == .batchCompleted {
+            if usesBatchSkeleton {
+                return IOSAppLocalization.string(
+                    "上一批已全部完成并收录。点「代笔下一批」会先拟定整批骨架交你确认。",
+                    defaultValue: "上一批已全部完成并收录。点「代笔下一批」会先拟定整批骨架交你确认。"
+                )
+            }
             return IOSAppLocalization.string(
                 "上一批已全部完成并收录。点「代笔下一批」继续连写，或修改章数后再开始。",
                 defaultValue: "上一批已全部完成并收录。点「代笔下一批」继续连写，或修改章数后再开始。"
@@ -2201,6 +2254,13 @@ struct NovelWritingContextSheet: View {
             return IOSAppLocalization.string(
                 "本章已完成。点「代笔下一章」继续，或修改章数后再开始。",
                 defaultValue: "本章已完成。点「代笔下一章」继续，或修改章数后再开始。"
+            )
+        }
+        if usesBatchSkeleton {
+            return IOSAppLocalization.formatted(
+                "最多连续 %lld 章。开批先按卷规划拟定整批骨架，确认后自动连写；每章写完会检查有没有推进，水了会自动改写。",
+                defaultValue: "最多连续 %lld 章。开批先按卷规划拟定整批骨架，确认后自动连写；每章写完会检查有没有推进，水了会自动改写。",
+                arguments: [NovelGhostwriteBatch.maxChapterCount]
             )
         }
         return IOSAppLocalization.formatted(

@@ -359,6 +359,10 @@ final class NovelCreationViewModel {
     @ObservationIgnored private var pendingExternalMutationProjectIDs: [NovelProjectID: Bool] = [:]
     @ObservationIgnored private var externalMutationRefreshTask: Task<Void, Never>?
     @ObservationIgnored private var ghostwriteProgressWriteTask: Task<Bool, Never>?
+    /// 节奏账缓存（按项目）；设置页展示与代笔判水共用。
+    private(set) var pacingLedgers: [NovelProjectID: NovelPacingLedgerRecord] = [:]
+    /// 卷规划未保存的草稿（按项目）：切模式或关闭设置页不丢。
+    var volumePlanDrafts: [NovelProjectID: String] = [:]
 
     init(creation: any NovelCreation) {
         self.creation = creation
@@ -465,6 +469,112 @@ final class NovelCreationViewModel {
         }
         ghostwriteProgressWriteTask = task
         return task
+    }
+
+    // MARK: 代笔节奏
+
+    func executeGhostwritePlanningTask(
+        projectID: NovelProjectID,
+        branchID: NovelBranchID,
+        task: NovelStructuredModelTask
+    ) async throws -> NovelStructuredModelOutput {
+        try await creation.executeGhostwritePlanningTask(
+            projectID: projectID,
+            branchID: branchID,
+            task: task
+        )
+    }
+
+    /// 节奏账：内存为准，首次读取时从 sidecar 回填。
+    func pacingLedger(projectID: NovelProjectID) async -> NovelPacingLedgerRecord {
+        if let cached = pacingLedgers[projectID] { return cached }
+        let loaded = (try? await creation.loadPacingLedger(projectID: projectID))
+            ?? NovelPacingLedgerRecord(projectID: projectID)
+        pacingLedgers[projectID] = pacingLedgers[projectID] ?? loaded
+        return pacingLedgers[projectID] ?? loaded
+    }
+
+    /// 有「卷规划」资料但内容无法识别（作者在资料页改坏了格式）。
+    var unreadableVolumePlanMaterialID: NovelMaterialID? {
+        guard currentVolumePlan == nil else { return nil }
+        return projectSnapshot?.materials.first {
+            $0.kind == .custom(NovelVolumePlan.customKind) && !$0.isDeleted
+        }?.id
+    }
+
+    var currentVolumePlan: NovelVolumePlan.Located? {
+        guard let projectSnapshot else { return nil }
+        return NovelVolumePlan.current(
+            materials: projectSnapshot.materials,
+            revisions: projectSnapshot.materialRevisions
+        )
+    }
+
+    /// 当前分支工作稿最近 `limit` 章在节奏账里的条目（缺账的章跳过）。
+    func recentPacing(
+        branchID: NovelBranchID,
+        limit: Int
+    ) async -> [(ordinal: Int, entry: NovelPacingLedgerEntry)] {
+        guard let project = projectSnapshot,
+              let branch = project.branches.first(where: { $0.id == branchID }) else { return [] }
+        let ledger = await pacingLedger(projectID: project.project.id)
+        let working = NovelBranchSemantics.workingManuscriptChapters(
+            branch: branch,
+            chapters: project.chapters,
+            chapterVersions: project.chapterVersions
+        )
+        return working.suffix(limit).compactMap { chapter in
+            ledger.entry(for: chapter.versionID).map { (chapter.ordinal, $0) }
+        }
+    }
+
+    /// 拟定卷规划草稿（不落盘）；`direction` 为空时交给模型按总纲与已写内容判断。
+    func proposeVolumePlan(direction: String) async throws -> NovelVolumePlan {
+        guard let projectID = projectSnapshot?.project.id, let branchID = selectedBranchID else {
+            throw NovelError.invalidInput("请先打开一个小说项目。")
+        }
+        let recent = await recentPacing(branchID: branchID, limit: NovelPacingPolicy.recentWindow)
+            .map { "第\($0.ordinal)章：\($0.entry.coreChange)" }
+        let reached = currentVolumePlan?.plan.milestones.filter(\.isReached).map(\.text) ?? []
+        let output = try await creation.executeGhostwritePlanningTask(
+            projectID: projectID,
+            branchID: branchID,
+            task: .volumePlan(context: NovelVolumePlan.proposalContext(
+                direction: direction,
+                recentChanges: recent,
+                reachedMilestones: reached
+            ))
+        )
+        guard projectSnapshot?.project.id == projectID, selectedBranchID == branchID else {
+            throw NovelError.invalidInput("项目或分支已切换，已丢弃这次生成的卷规划。")
+        }
+        guard case .volumePlan(let proposal) = output else {
+            throw NovelError.invalidInput("卷规划拟定返回了错误的结构。")
+        }
+        return NovelVolumePlan(proposal: proposal, direction: direction)
+    }
+
+    /// 作者保存即确认；宿主推进里程碑也走这里。
+    func saveVolumePlan(_ plan: NovelVolumePlan) async {
+        // 优先写回当前识别出的那份；格式被改坏时按资料类型找，避免重复建第二份卷规划。
+        let existing = currentVolumePlan?.materialID ?? unreadableVolumePlanMaterialID
+        await saveMaterial(
+            materialID: existing,
+            kind: .custom(NovelVolumePlan.customKind),
+            title: NovelVolumePlan.title,
+            content: plan.markdown(),
+            tags: [],
+            injectionMode: .off,
+            refreshProjectList: false
+        )
+    }
+
+    /// 写入失败只影响跨启动缓存（下次按需补标），不阻断代笔。
+    func recordPacingEntries(_ entries: [NovelPacingLedgerEntry], projectID: NovelProjectID) async {
+        var ledger = await pacingLedger(projectID: projectID)
+        entries.forEach { ledger.upsert($0) }
+        pacingLedgers[projectID] = ledger
+        try? await creation.savePacingLedger(ledger)
     }
 
     func loadGhostwriteBatchProgress(
@@ -2698,13 +2808,15 @@ final class NovelCreationViewModel {
         projectID: NovelProjectID,
         branchID: NovelBranchID,
         candidateID: NovelCandidateID,
-        prepareNextPlan: Bool
+        prepareNextPlan: Bool,
+        nextPlanSkeletonLine: String? = nil
     ) async throws -> NovelGhostwriteChapterAdjudicationResult {
         let result = try await creation.adjudicateAndCollectGhostwriteChapter(
             projectID: projectID,
             branchID: branchID,
             candidateID: candidateID,
-            prepareNextPlan: prepareNextPlan
+            prepareNextPlan: prepareNextPlan,
+            nextPlanSkeletonLine: nextPlanSkeletonLine
         )
         // A refresh failure after the atomic commit must not turn into another
         // adjudication/model request. The session performs its own durable refresh too.
@@ -2721,13 +2833,15 @@ final class NovelCreationViewModel {
         projectID: NovelProjectID,
         branchID: NovelBranchID,
         nextChapterOrdinal: Int,
-        previousPlanSummary: String?
+        previousPlanSummary: String?,
+        skeletonLine: String? = nil
     ) async throws -> NovelChapterPlanRecord {
         let plan = try await creation.proposeAndConfirmNextChapterPlan(
             projectID: projectID,
             branchID: branchID,
             nextChapterOrdinal: nextChapterOrdinal,
-            previousPlanSummary: previousPlanSummary
+            previousPlanSummary: previousPlanSummary,
+            skeletonLine: skeletonLine
         )
         // 自动确认合同后刷新快照，供代笔 pipeline 立刻读到新 digest。
         try await refreshCurrentSelection(

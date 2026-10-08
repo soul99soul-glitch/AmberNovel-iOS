@@ -8,13 +8,15 @@ extension DefaultNovelCreation {
         projectID: NovelProjectID,
         branchID: NovelBranchID,
         nextChapterOrdinal: Int,
-        previousPlanSummary: String?
+        previousPlanSummary: String?,
+        skeletonLine: String?
     ) async throws -> NovelChapterPlanRecord {
         try await proposeNextChapterPlan(
             projectID: projectID,
             branchID: branchID,
             nextChapterOrdinal: nextChapterOrdinal,
             previousPlanSummary: previousPlanSummary,
+            skeletonLine: skeletonLine,
             status: .confirmed
         )
     }
@@ -32,6 +34,7 @@ extension DefaultNovelCreation {
             branchID: branchID,
             nextChapterOrdinal: nextChapterOrdinal,
             previousPlanSummary: previousPlanSummary,
+            skeletonLine: nil,
             status: .draft
         )
     }
@@ -43,6 +46,7 @@ extension DefaultNovelCreation {
         branchID: NovelBranchID,
         nextChapterOrdinal: Int,
         previousPlanSummary: String?,
+        skeletonLine: String?,
         status: NovelChapterPlanStatus
     ) async throws -> NovelChapterPlanRecord {
         try await recoverGenerationStateIfNeeded(requiredProjectID: projectID)
@@ -69,7 +73,8 @@ extension DefaultNovelCreation {
             document: loaded.document,
             branch: branch,
             nextChapterOrdinal: nextChapterOrdinal,
-            previousPlanSummary: previousPlanSummary
+            previousPlanSummary: previousPlanSummary,
+            skeletonLine: skeletonLine
         )
         let executor = NovelStructuredModelExecutor(modelRunner: modelRunner)
         let preparation = try await executor.prepare(
@@ -129,14 +134,66 @@ extension DefaultNovelCreation {
         return plan
     }
 
+    /// 节奏判定 / 骨架拟定与评审 / 卷规划拟定：创作模型策略，单次结构化调用，不落盘。
+    /// 卷规划与骨架拟定在调用方上下文前自动补上本分支的故事上下文（总纲、状态、未结线索、往后几章）。
+    func executeGhostwritePlanningTask(
+        projectID: NovelProjectID,
+        branchID: NovelBranchID,
+        task: NovelStructuredModelTask
+    ) async throws -> NovelStructuredModelOutput {
+        let loaded = try await loadCommittedProject(id: projectID)
+        var task = task
+        if let branch = loaded.document.branches.first(where: { $0.id == branchID }) {
+            let story = Self.chapterPlanProposalContext(
+                document: loaded.document,
+                branch: branch,
+                nextChapterOrdinal: branch.workingChapterSelections.count + 1,
+                previousPlanSummary: nil
+            )
+            switch task {
+            case .volumePlan(let context):
+                task = .volumePlan(context: story + "\n\n" + context)
+            case .batchSkeleton(let context):
+                task = .batchSkeleton(context: story + "\n\n" + context)
+            default:
+                break
+            }
+        }
+        let executor = NovelStructuredModelExecutor(modelRunner: modelRunner)
+        let preparation = try await executor.prepare(
+            modelPolicy: modelPolicy(for: .creation, in: loaded.document),
+            taskKind: task.taskKind,
+            requestedInputBudgetTokens: NovelStructuredModelExecutor
+                .maximumInternalInputBudgetTokens
+        )
+        let request = NovelStructuredModelExecutionRequest(
+            runID: NovelRunID(),
+            modelPolicy: preparation.modelPolicy,
+            task: task
+        )
+        return try await executor.executePrepared(
+            try executor.prepareInvocation(request, preparation: preparation),
+            noOutputTimeout: factRequestTimeout
+        ).output
+    }
+
     static func chapterPlanProposalContext(
         document: NovelProjectDocumentV1,
         branch: NovelBranchRecord,
         nextChapterOrdinal: Int,
-        previousPlanSummary: String?
+        previousPlanSummary: String?,
+        skeletonLine: String? = nil
     ) -> String {
         var sections: [String] = []
         sections.append("NEXT CHAPTER ORDINAL\n\(max(1, nextChapterOrdinal))")
+        // 紧跟章序：批内审稿按前缀截断上下文，骨架行必须留在最前面。
+        if let skeletonLine = skeletonLine?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !skeletonLine.isEmpty {
+            sections.append(
+                "BATCH SKELETON LINE FOR THIS CHAPTER (confirmed by the author; the chapter must end with this state change)\n"
+                    + skeletonLine
+            )
+        }
 
         if let outline = materialText(kind: .masterOutline, in: document) {
             sections.append("MASTER OUTLINE\n" + clip(outline, limit: 6_000))
@@ -193,6 +250,19 @@ extension DefaultNovelCreation {
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !previous.isEmpty {
             sections.append("PREVIOUS CHAPTER PLAN SUMMARY\n" + clip(previous, limit: 2_000))
+        }
+        // 放在上一章计划摘要之后：批内审稿按前缀截断上下文，线索段不能挤掉摘要。
+        if let state = document.stateSnapshots.first(where: { $0.id == branch.currentStateSnapshotID }) {
+            let threads = NovelWorkspaceContextAssembler.openStoryThreads(
+                document: document,
+                state: state
+            )
+            if !threads.isEmpty {
+                sections.append(
+                    "OPEN THREADS (planted, not yet paid off; advance or pay off one when it fits, do not restage)\n"
+                        + threads.joined(separator: "\n")
+                )
+            }
         }
 
         sections.append("CANON CHAPTER COUNT ON BRANCH\n\(chapterCount)")

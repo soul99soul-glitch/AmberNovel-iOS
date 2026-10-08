@@ -880,6 +880,27 @@ actor NovelFileProjectRepository: NovelProjectPersisting {
         }
     }
 
+    func loadPacingLedger(projectID: NovelProjectID) async throws -> NovelPacingLedgerRecord? {
+        let url = pacingLedgerURL(projectID: projectID)
+        guard fileManager.fileExists(atPath: url.path) else { return nil }
+        let record = try makeDecoder().decode(
+            NovelPacingLedgerRecord.self,
+            from: Data(contentsOf: url)
+        )
+        return record.projectID == projectID ? record : nil
+    }
+
+    func savePacingLedger(_ record: NovelPacingLedgerRecord) async throws {
+        guard projectExistsOnDisk(record.projectID) else {
+            throw NovelError.projectNotFound(record.projectID)
+        }
+        try fileManager.createDirectory(at: pacingLedgerDirectory, withIntermediateDirectories: true)
+        try makeEncoder().encode(record).write(
+            to: pacingLedgerURL(projectID: record.projectID),
+            options: [.atomic]
+        )
+    }
+
     private var projectDirectory: URL {
         rootDirectory.appendingPathComponent("projects", isDirectory: true)
     }
@@ -912,6 +933,14 @@ actor NovelFileProjectRepository: NovelProjectPersisting {
 
     private var ghostwriteProgressDirectory: URL {
         rootDirectory.appendingPathComponent("ghostwrite-progress", isDirectory: true)
+    }
+
+    private var pacingLedgerDirectory: URL {
+        rootDirectory.appendingPathComponent("pacing-ledger", isDirectory: true)
+    }
+
+    private func pacingLedgerURL(projectID: NovelProjectID) -> URL {
+        pacingLedgerDirectory.appendingPathComponent("\(projectID.description).json")
     }
 
     private var tombstoneDirectory: URL {

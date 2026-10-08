@@ -83,7 +83,8 @@ extension DefaultNovelCreation {
         projectID: NovelProjectID,
         branchID: NovelBranchID,
         candidateID: NovelCandidateID,
-        prepareNextPlan: Bool
+        prepareNextPlan: Bool,
+        nextPlanSkeletonLine: String?
     ) async throws -> NovelGhostwriteChapterAdjudicationResult {
         try await recoverGenerationStateIfNeeded(requiredProjectID: projectID)
         let loaded = try await loadCommittedProject(id: projectID)
@@ -222,6 +223,7 @@ extension DefaultNovelCreation {
                 document: loaded.document,
                 branch: branch,
                 currentPlan: plan,
+                skeletonLine: nextPlanSkeletonLine,
                 maximumTokens: nextPlanBudget
             )
             : ""
@@ -327,6 +329,7 @@ private enum NovelGhostwriteAdjudicationContext {
         document: NovelProjectDocumentV1,
         branch: NovelBranchRecord,
         currentPlan: NovelChapterPlanRecord,
+        skeletonLine: String?,
         maximumTokens: Int
     ) -> String {
         guard maximumTokens > 0 else { return "" }
@@ -341,7 +344,8 @@ private enum NovelGhostwriteAdjudicationContext {
             document: document,
             branch: branch,
             nextChapterOrdinal: currentOrdinal + 1,
-            previousPlanSummary: currentPlan.ghostwriteBatchSummary()
+            previousPlanSummary: currentPlan.ghostwriteBatchSummary(),
+            skeletonLine: skeletonLine
         )
         return boundedPrefix(
             instruction + "\n\n" + context,

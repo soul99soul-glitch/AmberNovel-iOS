@@ -45,6 +45,9 @@ protocol NovelProjectPersisting: AnyObject, Sendable {
         projectID: NovelProjectID,
         branchID: NovelBranchID
     ) async throws
+    /// 节奏账缓存 sidecar；默认实现为空，文件仓覆盖。
+    func loadPacingLedger(projectID: NovelProjectID) async throws -> NovelPacingLedgerRecord?
+    func savePacingLedger(_ record: NovelPacingLedgerRecord) async throws
 }
 
 extension NovelProjectPersisting {
@@ -67,6 +70,15 @@ extension NovelProjectPersisting {
     ) async throws {
         _ = projectID
         _ = branchID
+    }
+
+    func loadPacingLedger(projectID: NovelProjectID) async throws -> NovelPacingLedgerRecord? {
+        _ = projectID
+        return nil
+    }
+
+    func savePacingLedger(_ record: NovelPacingLedgerRecord) async throws {
+        _ = record
     }
 
     func commitProject(
@@ -1055,6 +1067,14 @@ actor DefaultNovelCreation: NovelCreation {
             projectID: projectID,
             branchID: branchID
         )
+    }
+
+    func loadPacingLedger(projectID: NovelProjectID) async throws -> NovelPacingLedgerRecord? {
+        try await repository.loadPacingLedger(projectID: projectID)
+    }
+
+    func savePacingLedger(_ record: NovelPacingLedgerRecord) async throws {
+        try await repository.savePacingLedger(record)
     }
 }
 

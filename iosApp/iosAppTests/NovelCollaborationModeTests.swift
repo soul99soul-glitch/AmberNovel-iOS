@@ -485,6 +485,332 @@ final class NovelCollaborationModeTests: XCTestCase {
         try await assertGhostwriteBatchCompletes(targetChapterCount: 10)
     }
 
+    /// 写后防水：判水的候选按改写预算重写，过关稿收录后写入节奏账。
+    @MainActor
+    func testGhostwritePacingCheckRewritesWaterChapterAndRecordsLedger() async throws {
+        var document = try seedGhostwriteMaterials(in: NovelTestFixtures.document())
+        let branchID = try XCTUnwrap(document.branches.first?.id)
+        document = try NovelReducer.apply(.setCollaborationMode(
+            NovelSetCollaborationModeCommand(
+                context: NovelTestFixtures.context(configRevision: document.project.configRevision),
+                projectID: document.project.id,
+                branchID: branchID,
+                mode: .ghostwrite
+            )
+        ), to: document).document
+        document = try NovelReducer.apply(.upsertChapterPlan(NovelUpsertChapterPlanCommand(
+            context: NovelTestFixtures.context(configRevision: document.project.configRevision),
+            projectID: document.project.id,
+            branchID: branchID,
+            planID: NovelChapterPlanID(),
+            status: .confirmed,
+            outlinePlacement: "旧墙",
+            goalAndConflict: "林晚找到线索",
+            mustHappen: ["林晚必须留下本章独有的线索"],
+            mustNotHappen: [],
+            endingHook: "",
+            visibleFacts: []
+        )), to: document).document
+
+        let token = "pacing-chapter-1-evidence"
+        let water = "第1章正文：林晚又一次核对旧账，局面照旧。"
+        let healed = "第1章正文：林晚撕开旧墙，\(token) 让她第一次看清幕后之人。"
+        func pacing(newScore: Int, repeats: String) -> NovelModelScript {
+            NovelModelScript(steps: [.delta("""
+            # 五轴
+            事件 \(newScore)
+            关系 0
+            认知 \(newScore)
+            内心 0
+            蓄势 1
+            # 强度
+            3
+            # 节奏位
+            升级
+            # 主要变化
+            林晚看清幕后之人
+            # 例行公事
+            否
+            # 新意分
+            \(newScore)
+            # 重复
+            \(repeats)
+            # 落实骨架
+            无
+            """), .complete])
+        }
+        let adapter = ScriptedNovelModelAdapter(
+            resolvedModel: NovelResolvedModel(
+                providerID: "pacing-test-provider",
+                ownerProviderID: "pacing-test-owner",
+                modelID: "pacing-test-model",
+                wireModelID: "pacing-test-wire",
+                displayName: "Pacing Test Model",
+                contextWindowTokens: 128_000
+            ),
+            scripts: [
+                NovelModelScript(steps: [.delta(water), .complete]),
+                pacing(newScore: 1, repeats: "- 第0章：又一次核对旧账"),
+                pacing(newScore: 1, repeats: "- 第0章：又一次核对旧账"),
+                NovelModelScript(steps: [.delta(healed), .complete]),
+                pacing(newScore: 2, repeats: ""),
+                pacing(newScore: 3, repeats: ""),
+                NovelModelScript(steps: [.delta(try makeBatchAdjudicationJSON(
+                    chapterNumber: 1,
+                    targetChapterCount: 1,
+                    candidate: healed,
+                    evidenceToken: token
+                )), .complete]),
+            ]
+        )
+        let repository = InMemoryNovelProjectRepository()
+        _ = try await repository.createProject(document)
+        let workspace = NovelCreationViewModel(creation: DefaultNovelCreation(
+            repository: repository,
+            modelRunner: adapter
+        ))
+        await workspace.loadProjects(selecting: document.project.id)
+        let session = NovelSessionViewModel(workspace: workspace, chapterPacingChecksEnabled: true)
+        await session.bindToCurrentSelection()
+        XCTAssertTrue(session.startGhostwriteChapter(targetChapterCount: 1))
+
+        let deadline = Date().addingTimeInterval(30)
+        while Date() < deadline {
+            if let progress = session.ghostwriteProgress,
+               progress.pauseReason != nil,
+               !session.isGhostwriting {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+
+        let progress = try XCTUnwrap(session.ghostwriteProgress)
+        XCTAssertEqual(progress.pauseReason, .chapterCompleted, progress.detailMessage ?? "")
+        let project = try XCTUnwrap(workspace.projectSnapshot)
+        let collected = project.candidates.filter { $0.status == .collected }
+        XCTAssertEqual(collected.map(\.content), [healed])
+
+        let requests = await adapter.requests
+        XCTAssertEqual(requests.count, 7, "prose + 2 pacing, rewrite + 2 pacing, adjudication")
+        let rewrite = requests[3].messages.map(\.content).joined(separator: "\n")
+        XCTAssertTrue(rewrite.contains("本章没有带来新的变化"))
+        XCTAssertTrue(rewrite.contains("又一次核对旧账"))
+
+        let version = try XCTUnwrap(project.chapterVersions.first {
+            $0.sourceCandidateID == collected.first?.id
+        })
+        let ledger = await workspace.pacingLedger(projectID: document.project.id)
+        let entry = try XCTUnwrap(ledger.entry(for: version.id))
+        XCTAssertEqual(entry.passes.map(\.newScore).sorted(), [2, 3])
+        XCTAssertEqual(entry.coreChange, "林晚看清幕后之人")
+    }
+
+    @MainActor
+    func testGhostwriteSkeletonBatchConfirmsOnceAndDrivesChapterPlans() async throws {
+        try await runSkeletonBatch(firstChapterLandsSkeleton: true)
+    }
+
+    @MainActor
+    func testGhostwriteSkeletonReplansRemainingChaptersAfterDeviation() async throws {
+        try await runSkeletonBatch(firstChapterLandsSkeleton: false)
+    }
+
+    /// 有卷规划的 2 章批次：开批拟骨架 → 停下确认 → 每章按骨架行拟计划 → 里程碑打勾；
+    /// 第 1 章没落实骨架行时，第 2 章前重排剩余骨架。
+    @MainActor
+    private func runSkeletonBatch(firstChapterLandsSkeleton: Bool) async throws {
+        var document = try seedGhostwriteMaterials(in: NovelTestFixtures.document())
+        let branchID = try XCTUnwrap(document.branches.first?.id)
+        document = try NovelReducer.apply(.setCollaborationMode(
+            NovelSetCollaborationModeCommand(
+                context: NovelTestFixtures.context(configRevision: document.project.configRevision),
+                projectID: document.project.id,
+                branchID: branchID,
+                mode: .ghostwrite
+            )
+        ), to: document).document
+        let volume = NovelVolumePlan(
+            goal: "林晚揭开幕后之人",
+            milestones: [.init(text: "林晚找到幕后之人", targetChapter: 1, reachedChapter: nil)]
+        )
+        document = try NovelReducer.apply(.reviseMaterial(NovelReviseMaterialCommand(
+            context: NovelTestFixtures.context(configRevision: document.project.configRevision),
+            projectID: document.project.id,
+            materialID: NovelMaterialID(),
+            revisionID: NovelMaterialRevisionID(),
+            kind: .custom(NovelVolumePlan.customKind),
+            title: NovelVolumePlan.title,
+            content: volume.markdown(),
+            tags: [],
+            injectionMode: .off,
+            aliases: []
+        )), to: document).document
+
+        func skeleton(_ changes: [String]) -> NovelModelScript {
+            let chapters = changes.enumerated().map { index, change in
+                """
+                ### 第\(index + 1)章
+                状态变化：\(change)
+                代价：失去退路
+                线索：无
+                节奏位：升级
+                强度：3
+                预计字数：3000
+                钩子：门外脚步
+                """
+            }.joined(separator: "\n")
+            return NovelModelScript(steps: [.delta("""
+            # 起点
+            林晚只有一封无名信
+            # 终点
+            林晚当众揭穿幕后之人
+            # 章节
+            \(chapters)
+            """), .complete])
+        }
+        let review = NovelModelScript(steps: [.delta("""
+        # 硬门槛
+        1. 通过
+        2. 通过
+        3. 通过
+        4. 通过
+        # 打分
+        推进幅度 4
+        代价与风险 3
+        新信息 3
+        冲突升级 3
+        旧线处理 3
+        # 扣分理由
+        """), .complete])
+        func pacing(landed: Bool, milestone: String) -> NovelModelScript {
+            NovelModelScript(steps: [.delta("""
+            # 五轴
+            事件 2
+            关系 1
+            认知 2
+            内心 1
+            蓄势 1
+            # 强度
+            3
+            # 节奏位
+            升级
+            # 主要变化
+            林晚逼近幕后之人
+            # 例行公事
+            否
+            # 新意分
+            2
+            # 重复
+            # 落实骨架
+            \(landed ? "是" : "否")
+            # 达成里程碑
+            \(milestone)
+            """), .complete])
+        }
+        let chapterPlan = NovelModelScript(steps: [.delta("""
+        # 章名
+        旧墙
+        # 目标
+        林晚撕开旧墙
+        # 必发生
+        - 林晚撕开旧墙，失去退路
+        # 禁止发生
+        # 章末钩子
+        # 可见要点
+        """), .complete])
+        let tokens = ["skeleton-chapter-1-evidence", "skeleton-chapter-2-evidence"]
+        let bodies = tokens.enumerated().map { index, token in
+            "第\(index + 1)章正文：林晚撕开旧墙，\(token) 让局面再进一步。"
+        }
+        var scripts = [
+            skeleton(["林晚撕开旧墙找到密道", "林晚当众揭穿幕后之人"]),
+            review,
+            chapterPlan,
+            NovelModelScript(steps: [.delta(bodies[0]), .complete]),
+            pacing(landed: firstChapterLandsSkeleton, milestone: "林晚找到幕后之人"),
+            pacing(landed: firstChapterLandsSkeleton, milestone: "林晚找到幕后之人"),
+            NovelModelScript(steps: [.delta(try makeBatchAdjudicationJSON(
+                chapterNumber: 1, targetChapterCount: 2, candidate: bodies[0], evidenceToken: tokens[0]
+            )), .complete]),
+        ]
+        if !firstChapterLandsSkeleton {
+            scripts += [skeleton(["林晚改从城南逼出幕后之人"]), review]
+        }
+        scripts += [
+            NovelModelScript(steps: [.delta(bodies[1]), .complete]),
+            pacing(landed: true, milestone: ""),
+            pacing(landed: true, milestone: ""),
+            NovelModelScript(steps: [.delta(try makeBatchAdjudicationJSON(
+                chapterNumber: 2, targetChapterCount: 2, candidate: bodies[1], evidenceToken: tokens[1]
+            )), .complete]),
+        ]
+        let adapter = ScriptedNovelModelAdapter(
+            resolvedModel: NovelResolvedModel(
+                providerID: "skeleton-test-provider",
+                ownerProviderID: "skeleton-test-owner",
+                modelID: "skeleton-test-model",
+                wireModelID: "skeleton-test-wire",
+                displayName: "Skeleton Test Model",
+                contextWindowTokens: 128_000
+            ),
+            scripts: scripts
+        )
+        let repository = InMemoryNovelProjectRepository()
+        _ = try await repository.createProject(document)
+        let workspace = NovelCreationViewModel(creation: DefaultNovelCreation(
+            repository: repository,
+            modelRunner: adapter
+        ))
+        await workspace.loadProjects(selecting: document.project.id)
+        let session = NovelSessionViewModel(workspace: workspace, chapterPacingChecksEnabled: true)
+        await session.bindToCurrentSelection()
+
+        func waitForPause() async throws -> NovelGhostwriteProgress {
+            let deadline = Date().addingTimeInterval(30)
+            while Date() < deadline {
+                if let progress = session.ghostwriteProgress,
+                   progress.pauseReason != nil,
+                   !session.isGhostwriting {
+                    return progress
+                }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            return try XCTUnwrap(session.ghostwriteProgress)
+        }
+
+        session.ghostwriteTargetChapterCount = 2
+        XCTAssertTrue(session.canStartGhostwriteChapter, "卷规划在场时多章批次不要求先确认本章计划")
+        XCTAssertTrue(session.startGhostwriteChapter(targetChapterCount: 2))
+        var progress = try await waitForPause()
+        XCTAssertEqual(progress.pauseReason, .planProposedForNewBatch, progress.detailMessage ?? "")
+        XCTAssertEqual(progress.batchSkeleton?.isConfirmed, false)
+        XCTAssertEqual(progress.batchSkeleton?.skeleton.lines.count, 2)
+        XCTAssertEqual(progress.statusLabel, "已拟定骨架 · 待确认")
+
+        XCTAssertTrue(session.continueGhostwriteChapter())
+        progress = try await waitForPause()
+        XCTAssertEqual(progress.pauseReason, .batchCompleted, progress.detailMessage ?? "")
+        let project = try XCTUnwrap(workspace.projectSnapshot)
+        XCTAssertEqual(project.candidates.filter { $0.status == .collected }.count, 2)
+
+        let requests = await adapter.requests
+        XCTAssertEqual(requests.count, scripts.count)
+        let texts = requests.map { $0.messages.map(\.content).joined(separator: "\n") }
+        XCTAssertTrue(texts[2].contains("BATCH SKELETON LINE FOR THIS CHAPTER"))
+        XCTAssertTrue(texts[2].contains("林晚撕开旧墙找到密道"), "第 1 章计划按骨架第 1 行拟定")
+        XCTAssertTrue(texts[6].contains("林晚当众揭穿幕后之人"), "审稿顺带拟第 2 章计划时带上骨架第 2 行")
+        if firstChapterLandsSkeleton {
+            XCTAssertEqual(progress.batchSkeleton?.skeleton.lines.map(\.stateChange), ["林晚撕开旧墙找到密道", "林晚当众揭穿幕后之人"])
+        } else {
+            XCTAssertTrue(texts[7].contains("ALREADY WRITTEN IN THIS BATCH"))
+            XCTAssertTrue(texts[7].contains("FIXED END STATE"))
+            XCTAssertTrue(texts[7].contains("FIXED CHAPTER 1"), "重排必须钉住审稿已轮换出的第 2 章计划")
+            XCTAssertEqual(progress.batchSkeleton?.skeleton.lines.map(\.stateChange), ["林晚撕开旧墙找到密道", "林晚改从城南逼出幕后之人"])
+        }
+        let milestone = try XCTUnwrap(workspace.currentVolumePlan?.plan.milestones.first)
+        XCTAssertEqual(milestone.reachedChapter, 1)
+    }
+
     func testCollaborationModeCanSwitchBackToCocreation() throws {
         var document = try seedGhostwriteMaterials(in: try NovelTestFixtures.document())
         document = try NovelReducer.apply(.setCollaborationMode(NovelSetCollaborationModeCommand(
@@ -2231,7 +2557,8 @@ final class NovelCollaborationModeTests: XCTestCase {
             projectID: document.project.id,
             branchID: document.branches[0].id,
             nextChapterOrdinal: 2,
-            previousPlanSummary: "Goal: 试探"
+            previousPlanSummary: "Goal: 试探",
+            skeletonLine: nil
         )
         XCTAssertEqual(plan.status, .confirmed)
         XCTAssertEqual(plan.outlinePlacement, "灯火")

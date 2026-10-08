@@ -5,9 +5,10 @@ import Foundation
 /// same receipts — restructured as canonical constraints:
 ///
 ///   1. 当前剧情状态 — summary + outline + gate constraints (always kept)
-///   2. 未回收伏笔   — open foreshadowing nodes from the passthrough area
-///   3. 本章相关节点 — chapter-plan digest + plan-matching material cards
+///   2. 本章相关节点 — chapter-plan digest + plan-matching material cards
 ///                     + the character identity map
+///   3. 未回收伏笔   — passthrough foreshadowing nodes + native open threads
+///                     (after the nodes so a long thread list cannot evict them)
 ///   4. 已确认决定   — roll-call of always-injected material cards
 ///
 /// Sections 2–4 drop when empty and are skipped from the tail when the whole
@@ -30,10 +31,9 @@ enum NovelWorkspaceContextAssembler {
             includeUnsynchronizedWarning: includeUnsynchronizedWarning
         ))
 
-        let foreshadowing = openForeshadowing(document: document)
-        if !foreshadowing.isEmpty {
-            sections.append("## 未回收伏笔 / Open foreshadowing\n" + foreshadowing.joined(separator: "\n"))
-        }
+        let native = document.map { openStoryThreads(document: $0, state: state) } ?? []
+        let foreshadowing = Array((openForeshadowing(document: document) + native)
+            .prefix(foreshadowingLineCap))
 
         if let document {
             let nodes = relevantNodes(
@@ -45,6 +45,11 @@ enum NovelWorkspaceContextAssembler {
             if !nodes.isEmpty {
                 sections.append("## 本章相关节点 / Nodes for this chapter\n" + nodes)
             }
+        }
+        if !foreshadowing.isEmpty {
+            sections.append("## 未回收伏笔 / Open foreshadowing\n" + foreshadowing.joined(separator: "\n"))
+        }
+        if let document {
             let decisions = confirmedDecisions(document: document)
             if !decisions.isEmpty {
                 sections.append("## 已确认决定 / Confirmed decisions\n" + decisions)
@@ -90,7 +95,7 @@ enum NovelWorkspaceContextAssembler {
         return lines.joined(separator: "\n")
     }
 
-    // MARK: - Section 2: open foreshadowing
+    // MARK: - Section 3: open foreshadowing
 
     /// Foreshadowing nodes live in the passthrough area until iOS maintains
     /// them natively (contract D-F); `status: open` is the node schema.
@@ -116,7 +121,43 @@ enum NovelWorkspaceContextAssembler {
         return lines
     }
 
-    // MARK: - Section 3: nodes for this chapter
+    /// iOS 原生同步把伏笔落成 `foreshadowing.<status>` 故事事件，摘要为「线索名: 摘要」。
+    /// 按线索名折叠：resolved 移除，其余保留最新一条摘要；最近被触及的线索排前，
+    /// 超出上限时丢的是最久没动的旧线。
+    static func openStoryThreads(
+        document: NovelProjectDocumentV1,
+        state: NovelStateSnapshotRecord
+    ) -> [String] {
+        let wanted = Set(state.eventIDs)
+        let events = document.events
+            .filter { wanted.contains($0.id) && $0.kind.hasPrefix("foreshadowing.") }
+            .sorted { $0.sequence < $1.sequence }
+        var lastTouched: [String: Int64] = [:]
+        var latest: [String: String] = [:]
+        for event in events {
+            let parts = event.summary.split(separator: ":", maxSplits: 1)
+            guard let head = parts.first else { continue }
+            let thread = head.trimmingCharacters(in: .whitespacesAndNewlines)
+            let summary = parts.count > 1
+                ? parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                : thread
+            guard !thread.isEmpty else { continue }
+            if event.kind == "foreshadowing.resolved" {
+                latest[thread] = nil
+                continue
+            }
+            lastTouched[thread] = event.sequence
+            latest[thread] = summary
+        }
+        return latest.keys
+            .sorted { lastTouched[$0, default: 0] > lastTouched[$1, default: 0] }
+            .prefix(foreshadowingLineCap)
+            .compactMap { thread in
+                latest[thread].map { "- \(thread)：\(String($0.prefix(160)))" }
+            }
+    }
+
+    // MARK: - Section 2: nodes for this chapter
 
     private static func relevantNodes(
         document: NovelProjectDocumentV1,

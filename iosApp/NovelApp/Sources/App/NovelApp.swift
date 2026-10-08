@@ -56,7 +56,10 @@ final class NovelAppModel {
                 toolRuntime: toolHost
             )
             creationViewModel = workspace
-            sessionViewModel = NovelSessionViewModel(workspace: workspace)
+            sessionViewModel = NovelSessionViewModel(
+                workspace: workspace,
+                chapterPacingChecksEnabled: true
+            )
             storageErrorMessage = nil
         } catch {
             creationViewModel = nil

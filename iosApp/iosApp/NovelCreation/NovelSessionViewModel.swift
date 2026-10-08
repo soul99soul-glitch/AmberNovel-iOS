@@ -633,6 +633,9 @@ final class NovelSessionViewModel {
     /// 与 tail 退役同步)。测试可注入 0 走立即退役的快路径,保持旧的「完成即清空」契约。
     @ObservationIgnored private let terminalQuietDelay: TimeInterval
     @ObservationIgnored private let composerDefaults: UserDefaults
+    /// 写后防水检查（每章并发两次节奏判定）。默认关：测试替身按固定顺序吐脚本，
+    /// 正式 App 在组装处显式打开。
+    @ObservationIgnored private let chapterPacingChecksEnabled: Bool
     /// 批量润色等待候选时的「run 落定」宽限窗:activeRunID 在 terminalAwaitingRefresh
     /// 窗口会短暂为 nil,落定判失败前必须先过这个窗。测试可注入小值加快失败用例。
     @ObservationIgnored private let batchPolishSettleGrace: TimeInterval
@@ -666,9 +669,11 @@ final class NovelSessionViewModel {
         terminalQuietDelay: TimeInterval = NovelSessionBottomFollowPolicy.terminalQuietDelay,
         batchPolishSettleGrace: TimeInterval = 5,
         batchPolishCandidateTimeout: TimeInterval = 900,
-        composerDefaults: UserDefaults = .standard
+        composerDefaults: UserDefaults = .standard,
+        chapterPacingChecksEnabled: Bool = false
     ) {
         self.workspace = workspace
+        self.chapterPacingChecksEnabled = chapterPacingChecksEnabled
         self.terminalQuietDelay = terminalQuietDelay
         self.batchPolishSettleGrace = batchPolishSettleGrace
         self.batchPolishCandidateTimeout = batchPolishCandidateTimeout
@@ -4840,6 +4845,12 @@ extension NovelSessionViewModel {
         return true
     }
 
+    /// 有卷规划的多章批次：第 1 章计划由确认后的骨架拟定，开批不要求事先确认本章计划。
+    private var startsWithBatchSkeleton: Bool {
+        NovelGhostwriteBatch.clamp(ghostwriteTargetChapterCount) > 1
+            && workspace.currentVolumePlan != nil
+    }
+
     var ghostwriteReadinessIssue: NovelGhostwriteReadinessIssue? {
         guard let project = workspace.projectSnapshot,
               let branchID = binding?.branchID else { return .branchNeedsSync }
@@ -4854,9 +4865,9 @@ extension NovelSessionViewModel {
             stateSnapshots: project.stateSnapshots,
             mainBranchID: project.project.mainBranchID,
             branchID: branchID,
-            requireChapterPlan: !canResumeGhostwriteWithoutPlan
+            requireChapterPlan: !canResumeGhostwriteWithoutPlan && !startsWithBatchSkeleton
         )
-        if canResumeGhostwriteWithoutPlan {
+        if canResumeGhostwriteWithoutPlan || startsWithBatchSkeleton {
             issues.removeAll { $0 == .missingChapterPlan }
         }
         // 批中续跑：同步由 pipeline 内 await，不在入口把「继续」整灰。
@@ -4883,7 +4894,7 @@ extension NovelSessionViewModel {
         if workspace.branchSnapshot?.currentState.hasStaleChapterPlots == true {
             return false
         }
-        if canResumeGhostwriteWithoutPlan { return true }
+        if canResumeGhostwriteWithoutPlan || startsWithBatchSkeleton { return true }
         // 完批后开新批：允许没有确认计划（pipeline 自动拟定），与批内第 2～N 章同路径。
         if ghostwriteProgressStorage?.pauseReason == .batchCompleted
             || ghostwriteProgressStorage?.pauseReason == .chapterCompleted {
@@ -4969,9 +4980,11 @@ extension NovelSessionViewModel {
         // 首次启动（无前批）仍需用户手动确认计划。
         let isStartingNewBatchAfterCompletion = !resumingBatch
             && (previous?.pauseReason == .batchCompleted || previous?.pauseReason == .chapterCompleted)
+        let startsWithSkeleton = target > 1 && workspace.currentVolumePlan != nil
         if confirmedPlan == nil,
            !canResumeGhostwriteWithoutPlan,
-           !isStartingNewBatchAfterCompletion {
+           !isStartingNewBatchAfterCompletion,
+           !startsWithSkeleton {
             operationErrorMessage = "代笔需要已确认的本章计划。"
             return false
         }
@@ -5061,7 +5074,13 @@ extension NovelSessionViewModel {
                 guard resumingBatch, !planChangedOnResume else { return [] }
                 return previous?.contractAmendments ?? []
             }(),
-            infraRetryCount: 0
+            infraRetryCount: 0,
+            batchSkeleton: {
+                guard resumingBatch, var skeleton = previous?.batchSkeleton else { return nil }
+                // 停在「已拟定 · 待确认」时点继续 = 作者确认骨架。
+                if previous?.pauseReason == .planProposedForNewBatch { skeleton.isConfirmed = true }
+                return skeleton
+            }()
         )
         ghostwriteTaskBinding = binding
         let backgroundLeaseOwnerID = UUID()
@@ -5294,6 +5313,10 @@ extension NovelSessionViewModel {
                     $0.currentChapterIndex = completed + 1
                 }
 
+                guard try await ensureGhostwriteBatchSkeleton(expectedBinding: expectedBinding) else {
+                    return
+                }
+
                 // 每章入口只取一次最新确认合同；章内修订始终绑定同一 ID 与 digest。
                 let plan: NovelChapterPlanRecord
                 if let existing = workspace.projectSnapshot?.confirmedChapterPlan(
@@ -5390,7 +5413,7 @@ extension NovelSessionViewModel {
         switch ghostwriteProgressStorage?.pauseReason {
         case .userPaused, .syncFailed, .infrastructureFailed, .backgroundInterrupted:
             return ghostwriteProgressStorage?.pauseReason ?? .userPaused
-        case .healBudgetExhausted, .acceptanceFailed, .obviousRepetition,
+        case .healBudgetExhausted, .acceptanceFailed, .obviousRepetition, .noNewChange,
              .blockingContinuity, .continuityAuditIncomplete:
             // 质量停机中途再被取消：保留可续跑的质量终态语义。
             return ghostwriteProgressStorage?.pauseReason ?? .userPaused
@@ -5489,8 +5512,9 @@ extension NovelSessionViewModel {
             // a brief moment. Keep the existing bounded settle before adjudication.
             _ = await refreshDurable(binding: binding, token: bindingToken)
             let settleDeadline = Date().addingTimeInterval(3)
+            // 会话侧的 run 也要收尾：防水不过会立刻重开写稿，否则撞「已有生成在进行中」。
             while Date() < settleDeadline,
-                  workspace.branchSnapshot?.branch.activeRunID != nil {
+                  workspace.branchSnapshot?.branch.activeRunID != nil || activeRunID != nil {
                 try Task.checkCancellation()
                 try? await Task.sleep(for: .milliseconds(150))
                 _ = await refreshDurable(binding: binding, token: bindingToken)
@@ -5516,6 +5540,32 @@ extension NovelSessionViewModel {
                 $0.candidateID = candidateID
                 $0.chapterPlanDigest = plan.contentDigest
             }
+            // 写后防水：在审稿收录之前判，不过就按现有改写预算重写本章。
+            var pacingPasses: [NovelChapterPacingV1] = []
+            if chapterPacingChecksEnabled,
+               let pacing = try await checkGhostwriteChapterPacing(
+                   candidateID: candidateID,
+                   expectedBinding: expectedBinding
+               ) {
+                try Task.checkCancellation()
+                if let summary = NovelPacingPolicy.rewriteSummary(for: pacing.verdict) {
+                    var repeats: [String] = []
+                    if case .water(let lines) = pacing.verdict { repeats = lines }
+                    let healed = await registerGhostwriteQualityFailure(
+                        binding: expectedBinding,
+                        reason: .noNewChange,
+                        detail: summary,
+                        missingMustHappen: [],
+                        repetitionBeats: repeats,
+                        continuityNotes: [],
+                        candidateID: candidateID,
+                        planDigest: plan.contentDigest
+                    )
+                    if healed { continue }
+                    return false
+                }
+                pacingPasses = pacing.passes
+            }
             let result = try await withGhostwriteInfraRetry(
                 binding: expectedBinding,
                 stage: "审核并收录"
@@ -5524,7 +5574,8 @@ extension NovelSessionViewModel {
                     projectID: expectedBinding.projectID,
                     branchID: expectedBinding.branchID,
                     candidateID: candidateID,
-                    prepareNextPlan: prepareNextPlan
+                    prepareNextPlan: prepareNextPlan,
+                    nextPlanSkeletonLine: ghostwriteSkeletonLine(chapterOffset: 2)
                 )
             }
             if result.didCollect {
@@ -5612,6 +5663,21 @@ extension NovelSessionViewModel {
                 return false
             }
             _ = await refreshDurable(binding: expectedBinding, token: bindingToken)
+            if !pacingPasses.isEmpty,
+               let version = workspace.projectSnapshot?.chapterVersions.first(where: {
+                   $0.sourceCandidateID == candidateID
+               }) {
+                await workspace.recordPacingEntries(
+                    [NovelPacingLedgerEntry(
+                        chapterVersionID: version.id,
+                        characterCount: version.content.count,
+                        passes: pacingPasses
+                    )],
+                    projectID: expectedBinding.projectID
+                )
+            }
+            // 同步前就标记：同步失败或暂停后续跑只补记账，这一章的判定结果拿不回来。
+            markGhostwriteSkeletonReplanIfNeeded(passes: pacingPasses, expectedBinding: expectedBinding)
 
             let synced = await awaitGhostwriteStateSync(expectedBinding: expectedBinding)
             try Task.checkCancellation()
@@ -5630,6 +5696,7 @@ extension NovelSessionViewModel {
                 )
                 return false
             }
+            await applyGhostwritePacingOutcome(passes: pacingPasses, expectedBinding: expectedBinding)
             return true
         }
     }
@@ -5699,6 +5766,363 @@ extension NovelSessionViewModel {
         return false
     }
 
+    // MARK: - 批次骨架
+
+    /// 当前分支工作稿的下一章（offset 1）或下下章（offset 2）对应的已确认骨架行。
+    private func ghostwriteSkeletonLine(chapterOffset: Int) -> String? {
+        guard let skeleton = ghostwriteProgressStorage?.batchSkeleton,
+              skeleton.isConfirmed,
+              let canon = workspace.branchSnapshot?.branch.workingChapterSelections.count else {
+            return nil
+        }
+        return skeleton.line(forChapterOrdinal: canon + chapterOffset)?.promptText
+    }
+
+    /// 有卷规划的多章批次：开批拟定骨架并停下等确认；章节偏离骨架后重排剩余行。
+    /// 返回 false 表示已暂停（等确认或拟定失败）。
+    private func ensureGhostwriteBatchSkeleton(
+        expectedBinding: NovelSessionBinding
+    ) async throws -> Bool {
+        guard let progress = ghostwriteProgressStorage,
+              progress.targetChapterCount > 1,
+              let volume = workspace.currentVolumePlan?.plan else { return true }
+        let remaining = progress.targetChapterCount - progress.completedChapterCount
+        if var current = progress.batchSkeleton {
+            guard current.isConfirmed else {
+                pauseForGhostwriteSkeletonConfirmation(current, expectedBinding: expectedBinding)
+                return false
+            }
+            guard current.needsReplan, remaining > 0 else { return true }
+            let written = await workspace.recentPacing(
+                branchID: expectedBinding.branchID,
+                limit: progress.completedChapterCount
+            ).map { "第\($0.ordinal)章：\($0.entry.coreChange)" }
+            let replanned = try await proposeGhostwriteSkeleton(
+                chapterCount: remaining,
+                volume: volume,
+                writtenInBatch: written,
+                fixedEndState: current.skeleton.endState,
+                expectedBinding: expectedBinding
+            )
+            current.skeleton.lines = Array(current.skeleton.lines.prefix(progress.completedChapterCount))
+                + replanned.skeleton.lines
+            current.review = replanned.review
+            current.hostIssues = replanned.hostIssues
+            if replanned.skeleton.endState.trimmingCharacters(in: .whitespacesAndNewlines)
+                != current.skeleton.endState.trimmingCharacters(in: .whitespacesAndNewlines) {
+                current.hostIssues.append("重排改动了本批终点：\(replanned.skeleton.endState)")
+            }
+            current.needsReplan = false
+            current.isConfirmed = replanned.passes
+            mutateGhostwriteProgress(binding: expectedBinding) { $0.batchSkeleton = current }
+            if !current.isConfirmed {
+                pauseForGhostwriteSkeletonConfirmation(current, expectedBinding: expectedBinding)
+                return false
+            }
+            return true
+        }
+        // 批中途才建的卷规划不回头补骨架。
+        guard progress.completedChapterCount == 0 else { return true }
+        guard !volume.pendingMilestones.isEmpty else {
+            pauseGhostwritePipeline(
+                binding: expectedBinding,
+                reason: .planProposalFailed,
+                detail: "本卷里程碑都已达成。请先在「卷规划」里更新或重新生成，再开新批。",
+                candidateID: nil
+            )
+            return false
+        }
+        var proposed = try await proposeGhostwriteSkeleton(
+            chapterCount: progress.targetChapterCount,
+            volume: volume,
+            writtenInBatch: [],
+            fixedEndState: nil,
+            expectedBinding: expectedBinding
+        )
+        proposed.isConfirmed = false
+        mutateGhostwriteProgress(binding: expectedBinding) { $0.batchSkeleton = proposed }
+        pauseForGhostwriteSkeletonConfirmation(proposed, expectedBinding: expectedBinding)
+        return false
+    }
+
+    private func pauseForGhostwriteSkeletonConfirmation(
+        _ skeleton: NovelGhostwriteBatchSkeleton,
+        expectedBinding: NovelSessionBinding
+    ) {
+        let issues = skeleton.hostIssues + skeleton.review.feedbackLines
+        let detail = skeleton.passes
+            ? "已拟定本批骨架，评审通过。骨架在代笔设置里，确认后按骨架连写。"
+            : "骨架评审 \(NovelSkeletonPolicy.maxRounds) 轮仍有问题，可在代笔设置里查看后确认或重新生成：\n"
+                + issues.prefix(3).map { "· \($0)" }.joined(separator: "\n")
+        pauseGhostwritePipeline(
+            binding: expectedBinding,
+            reason: .planProposedForNewBatch,
+            detail: detail,
+            candidateID: nil
+        )
+    }
+
+    /// 拟定 + 独立评审，不过就带扣分理由重拟，最多 `maxRounds` 轮；返回最后一轮结果。
+    private func proposeGhostwriteSkeleton(
+        chapterCount: Int,
+        volume: NovelVolumePlan,
+        writtenInBatch: [String],
+        fixedEndState: String?,
+        expectedBinding: NovelSessionBinding
+    ) async throws -> NovelGhostwriteBatchSkeleton {
+        mutateGhostwriteProgress(binding: expectedBinding) {
+            $0.phase = .planning
+            $0.pauseReason = nil
+        }
+        let recent = try await recentGhostwritePacing(expectedBinding: expectedBinding)
+        let recentLines = recent.map { "第\($0.ordinal)章：\($0.entry.coreChange)" }
+        // 已确认的下一章计划（开批前作者确认的，或审稿已轮换出的）必须作为第 1 行，
+        // 否则重排出的新行对紧接着的这一章不起作用。
+        let fixedFirst = workspace.projectSnapshot?
+            .confirmedChapterPlan(for: expectedBinding.branchID)?
+            .ghostwriteBatchSummary()
+        let canon = workspace.branchSnapshot?.branch.workingChapterSelections.count ?? 0
+        let startOrdinal = ghostwriteProgressStorage?.batchSkeleton?.startOrdinal ?? canon + 1
+        var feedback: [String] = []
+        var result: NovelGhostwriteBatchSkeleton?
+        for round in 1...NovelSkeletonPolicy.maxRounds {
+            try Task.checkCancellation()
+            mutateGhostwriteProgress(binding: expectedBinding) {
+                $0.detailMessage = "拟定本批骨架（第 \(round)/\(NovelSkeletonPolicy.maxRounds) 轮）…"
+            }
+            guard case .batchSkeleton(var skeleton) = try await runGhostwritePlanningTask(
+                .batchSkeleton(context: NovelSkeletonPolicy.proposalContext(
+                    chapterCount: chapterCount,
+                    plan: volume,
+                    recentChanges: recentLines,
+                    fixedFirstChapterPlan: fixedFirst,
+                    writtenInBatch: writtenInBatch,
+                    fixedEndState: fixedEndState,
+                    feedback: feedback
+                )),
+                stage: "拟定骨架",
+                expectedBinding: expectedBinding
+            ) else {
+                throw NovelStructuredModelExecutionFailure(
+                    code: "invalid_structured_output",
+                    message: "骨架拟定返回了错误的结构。",
+                    isRetryable: true
+                )
+            }
+            skeleton.lines = Array(skeleton.lines.prefix(chapterCount))
+            let hostIssues = NovelSkeletonPolicy.hostIssues(
+                skeleton,
+                expectedCount: chapterCount,
+                trailing: writtenInBatch.isEmpty ? recent.map(\.entry) : []
+            )
+            guard case .batchSkeletonReview(let review) = try await runGhostwritePlanningTask(
+                .batchSkeletonReview(
+                    context: NovelSkeletonPolicy.reviewContext(recentChanges: recentLines + writtenInBatch),
+                    skeleton: NovelSkeletonPolicy.render(skeleton)
+                ),
+                stage: "评审骨架",
+                expectedBinding: expectedBinding
+            ) else {
+                throw NovelStructuredModelExecutionFailure(
+                    code: "invalid_structured_output",
+                    message: "骨架评审返回了错误的结构。",
+                    isRetryable: true
+                )
+            }
+            let candidate = NovelGhostwriteBatchSkeleton(
+                skeleton: skeleton,
+                review: review,
+                hostIssues: hostIssues,
+                startOrdinal: startOrdinal,
+                isConfirmed: true,
+                needsReplan: false
+            )
+            result = candidate
+            if candidate.passes { break }
+            feedback = hostIssues + review.feedbackLines
+        }
+        mutateGhostwriteProgress(binding: expectedBinding) { $0.detailMessage = nil }
+        guard let result else { throw CancellationError() }
+        return result
+    }
+
+    private func runGhostwritePlanningTask(
+        _ task: NovelStructuredModelTask,
+        stage: String,
+        expectedBinding: NovelSessionBinding
+    ) async throws -> NovelStructuredModelOutput {
+        let workspace = workspace
+        return try await withGhostwriteInfraRetry(binding: expectedBinding, stage: stage) {
+            try await workspace.executeGhostwritePlanningTask(
+                projectID: expectedBinding.projectID,
+                branchID: expectedBinding.branchID,
+                task: task
+            )
+        }
+    }
+
+    /// 收录并同步后：推进卷规划里程碑。
+    private func applyGhostwritePacingOutcome(
+        passes: [NovelChapterPacingV1],
+        expectedBinding: NovelSessionBinding
+    ) async {
+        let ordinal = workspace.branchSnapshot?.branch.workingChapterSelections.count ?? 0
+        if let reached = passes.map(\.reachedMilestone).first(where: { !$0.isEmpty }),
+           var volume = workspace.currentVolumePlan?.plan,
+           volume.markReached(reached, atChapter: ordinal) {
+            await workspace.saveVolumePlan(volume)
+        }
+    }
+
+    /// 刚收录的章两遍判定都说没落实骨架行：下一章前重排剩余骨架。
+    private func markGhostwriteSkeletonReplanIfNeeded(
+        passes: [NovelChapterPacingV1],
+        expectedBinding: NovelSessionBinding
+    ) {
+        guard !passes.isEmpty else { return }
+        let ordinal = workspace.branchSnapshot?.branch.workingChapterSelections.count ?? 0
+        if let skeleton = ghostwriteProgressStorage?.batchSkeleton,
+           skeleton.isConfirmed,
+           skeleton.line(forChapterOrdinal: ordinal) != nil,
+           passes.allSatisfy({ $0.landedSkeletonLine == false }) {
+            mutateGhostwriteProgress(binding: expectedBinding) {
+                $0.batchSkeleton?.needsReplan = true
+            }
+        }
+    }
+
+    /// 骨架卡「重新生成」：开批前丢弃草稿重拟；批中途则重排剩余骨架。
+    @discardableResult
+    func regenerateGhostwriteSkeleton() -> Bool {
+        guard let binding,
+              ghostwriteProgressStorage?.pauseReason == .planProposedForNewBatch,
+              ghostwriteProgressStorage?.batchSkeleton?.isConfirmed == false else { return false }
+        mutateGhostwriteProgress(binding: binding) {
+            if $0.completedChapterCount == 0 {
+                $0.batchSkeleton = nil
+            } else {
+                $0.batchSkeleton?.needsReplan = true
+            }
+        }
+        // 续跑：开批前没有骨架会重拟；批中途「待确认」被视为确认后按 needsReplan 重排。
+        return continueGhostwriteChapter()
+    }
+
+    // MARK: - 代笔节奏（写后防水）
+
+    /// 并发两遍节奏判定，按 `NovelPacingPolicy` 出结论。候选不存在时返回 nil（交给后续审稿报错）。
+    private func checkGhostwriteChapterPacing(
+        candidateID: NovelCandidateID,
+        expectedBinding: NovelSessionBinding
+    ) async throws -> (verdict: NovelPacingPolicy.Verdict, passes: [NovelChapterPacingV1])? {
+        guard let content = candidate(id: candidateID)?.content else { return nil }
+        mutateGhostwriteProgress(binding: expectedBinding) {
+            $0.detailMessage = "检查本章有没有推进新的变化…"
+        }
+        let recent = try await recentGhostwritePacing(expectedBinding: expectedBinding)
+        let context = NovelPacingContext.judgeContext(
+            recent: recent.map { ($0.ordinal, $0.entry.coreChange) },
+            previousChapterTail: recent.last?.content,
+            skeletonLine: ghostwriteSkeletonLine(chapterOffset: 1),
+            pendingMilestones: workspace.currentVolumePlan?.plan.pendingMilestones.map(\.text) ?? []
+        )
+        async let first = judgeGhostwriteChapterPacing(
+            context: context,
+            chapter: content,
+            expectedBinding: expectedBinding
+        )
+        async let second = judgeGhostwriteChapterPacing(
+            context: context,
+            chapter: content,
+            expectedBinding: expectedBinding
+        )
+        let passes = try await [first, second]
+        mutateGhostwriteProgress(binding: expectedBinding) { $0.detailMessage = nil }
+        return (
+            NovelPacingPolicy.verdict(
+                passes: passes,
+                characterCount: content.count,
+                recent: recent.map(\.entry)
+            ),
+            passes
+        )
+    }
+
+    /// 当前分支最近几章的节奏账；缺账（从未判过或正文已换版）的按章序单遍补标。
+    private func recentGhostwritePacing(
+        expectedBinding: NovelSessionBinding
+    ) async throws -> [(ordinal: Int, entry: NovelPacingLedgerEntry, content: String)] {
+        guard let project = workspace.projectSnapshot,
+              let branch = project.branches.first(where: { $0.id == expectedBinding.branchID }) else {
+            return []
+        }
+        let working = NovelBranchSemantics.workingManuscriptChapters(
+            branch: branch,
+            chapters: project.chapters,
+            chapterVersions: project.chapterVersions
+        )
+        let start = max(0, working.count - NovelPacingPolicy.recentWindow)
+        let ledger = await workspace.pacingLedger(projectID: expectedBinding.projectID)
+        func content(at index: Int) -> String? {
+            guard working.indices.contains(index) else { return nil }
+            return project.chapterVersions.first { $0.id == working[index].versionID }?.content
+        }
+        var result: [(ordinal: Int, entry: NovelPacingLedgerEntry, content: String)] = []
+        for index in start..<working.count {
+            guard let body = content(at: index) else { continue }
+            let versionID = working[index].versionID
+            if let entry = ledger.entry(for: versionID) {
+                result.append((working[index].ordinal, entry, body))
+                continue
+            }
+            let pass = try await judgeGhostwriteChapterPacing(
+                context: NovelPacingContext.judgeContext(
+                    recent: result.map { ($0.ordinal, $0.entry.coreChange) },
+                    previousChapterTail: content(at: index - 1),
+                    skeletonLine: nil,
+                    pendingMilestones: []
+                ),
+                chapter: body,
+                expectedBinding: expectedBinding
+            )
+            let entry = NovelPacingLedgerEntry(
+                chapterVersionID: versionID,
+                characterCount: body.count,
+                passes: [pass]
+            )
+            // 逐章落账：中途失败时已补好的章不必重补。
+            await workspace.recordPacingEntries([entry], projectID: expectedBinding.projectID)
+            result.append((working[index].ordinal, entry, body))
+        }
+        return result
+    }
+
+    private func judgeGhostwriteChapterPacing(
+        context: String,
+        chapter: String,
+        expectedBinding: NovelSessionBinding
+    ) async throws -> NovelChapterPacingV1 {
+        let workspace = workspace
+        let output = try await withGhostwriteInfraRetry(
+            binding: expectedBinding,
+            stage: "防水检查"
+        ) {
+            try await workspace.executeGhostwritePlanningTask(
+                projectID: expectedBinding.projectID,
+                branchID: expectedBinding.branchID,
+                task: .chapterPacing(context: context, chapter: chapter)
+            )
+        }
+        guard case .chapterPacing(let value) = output else {
+            throw NovelStructuredModelExecutionFailure(
+                code: "invalid_structured_output",
+                message: "节奏判定返回了错误的结构。",
+                isRetryable: true
+            )
+        }
+        return value
+    }
+
     /// 处理「已收录、待同步记账」：同步成功后 completed+=1，不重写、不新拟合同。
     private func settlePendingGhostwriteSyncCredit(
         expectedBinding: NovelSessionBinding
@@ -5731,7 +6155,9 @@ extension NovelSessionViewModel {
         // 新批首章（completed==0）：拟完计划后暂停让用户确认。
         // 批内后续（completed>0）：拟完直接连写，不中断节奏。
         let completedBeforeProposal = ghostwriteProgressStorage?.completedChapterCount ?? 0
+        // 作者已确认本批骨架时，首章计划按骨架行直接拟定，不再单独停下确认。
         let isAutoProposalForUserConfirmation = completedBeforeProposal == 0
+            && ghostwriteProgressStorage?.batchSkeleton?.isConfirmed != true
 
         mutateGhostwriteProgress(binding: expectedBinding) {
             $0.phase = .planning
@@ -5767,7 +6193,8 @@ extension NovelSessionViewModel {
                     projectID: expectedBinding.projectID,
                     branchID: expectedBinding.branchID,
                     nextChapterOrdinal: ordinal,
-                    previousPlanSummary: previousSummary
+                    previousPlanSummary: previousSummary,
+                    skeletonLine: ghostwriteSkeletonLine(chapterOffset: 1)
                 )
                 _ = await refreshDurable(binding: binding, token: bindingToken)
                 if isAutoProposalForUserConfirmation {
@@ -5833,7 +6260,9 @@ extension NovelSessionViewModel {
         if target == 1 {
             detail += " 请先定好下一章计划再继续。"
         } else {
-            detail += " 下一批请先确认首章计划。"
+            detail += workspace.currentVolumePlan != nil
+                ? " 下一批会先按卷规划拟定骨架交你确认。"
+                : " 下一批请先确认首章计划。"
         }
         mutateGhostwriteProgress(binding: expectedBinding) {
             $0.phase = .waitingUser
@@ -6170,7 +6599,7 @@ extension NovelSessionViewModel {
         let phase: NovelGhostwritePhase = switch reason {
         case .chapterCompleted, .batchCompleted, .planProposedForNewBatch: .waitingUser
         case .healBudgetExhausted: .waitingUser
-        case .acceptanceFailed, .obviousRepetition, .blockingContinuity,
+        case .acceptanceFailed, .obviousRepetition, .noNewChange, .blockingContinuity,
              .continuityAuditIncomplete, .userPaused, .cancelled,
              .planProposalFailed, .backgroundInterrupted:
             .paused

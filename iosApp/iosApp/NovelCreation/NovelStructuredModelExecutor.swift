@@ -11,6 +11,10 @@ enum NovelStructuredModelTaskKind: String, Codable, Equatable, CaseIterable, Sen
     case chapterAdjudication
     case chapterPlanProposal
     case workspacePlot
+    case chapterPacing
+    case batchSkeleton
+    case batchSkeletonReview
+    case volumePlan
 }
 
 enum NovelStructuredModelTask: Equatable, Sendable {
@@ -33,6 +37,11 @@ enum NovelStructuredModelTask: Equatable, Sendable {
     )
     case chapterPlanProposal(context: String)
     case workspacePlot(previousSummary: String, chapterTitle: String, chapterContent: String)
+    /// 代笔节奏：`context` 由 `NovelPacingContext` 构造，`chapter` 为待判章节正文。
+    case chapterPacing(context: String, chapter: String)
+    case batchSkeleton(context: String)
+    case batchSkeletonReview(context: String, skeleton: String)
+    case volumePlan(context: String)
 }
 
 struct NovelStructuredModelExecutionRequest: Equatable, Sendable {
@@ -52,6 +61,10 @@ enum NovelStructuredModelOutput: Equatable, Sendable {
     case chapterAdjudication(NovelChapterAdjudicationV1)
     case chapterPlanProposal(NovelChapterPlanProposalV1)
     case workspacePlot(NovelWorkspacePlotDraft)
+    case chapterPacing(NovelChapterPacingV1)
+    case batchSkeleton(NovelBatchSkeletonV1)
+    case batchSkeletonReview(NovelBatchSkeletonReviewV1)
+    case volumePlan(NovelVolumePlanProposalV1)
 }
 
 struct NovelStructuredModelExecutionEvidence: Equatable, Sendable {
@@ -678,6 +691,10 @@ private extension NovelStructuredModelTask {
         case .chapterAdjudication: .chapterAdjudication
         case .chapterPlanProposal: .chapterPlanProposal
         case .workspacePlot: .workspacePlot
+        case .chapterPacing: .chapterPacing
+        case .batchSkeleton: .batchSkeleton
+        case .batchSkeletonReview: .batchSkeletonReview
+        case .volumePlan: .volumePlan
         }
     }
 
@@ -693,6 +710,10 @@ private extension NovelStructuredModelTask {
         case .chapterAdjudication: .chapterAdjudicationV1
         case .chapterPlanProposal: .chapterPlanProposalV1
         case .workspacePlot: .workspacePlotV1
+        case .chapterPacing: .chapterPacingV1
+        case .batchSkeleton: .batchSkeletonV1
+        case .batchSkeletonReview: .batchSkeletonReviewV1
+        case .volumePlan: .volumePlanV1
         }
     }
 
@@ -711,6 +732,9 @@ private extension NovelStructuredModelTask {
         // Proposal uses creation model policy; purpose tag stays light-weight.
         case .chapterPlanProposal: .stateExtraction
         case .workspacePlot: .stateExtraction
+        // 节奏判定与骨架评审是审稿门；拟定类沿用创作侧的轻量标签。
+        case .chapterPacing, .batchSkeletonReview: .continuityAudit
+        case .batchSkeleton, .volumePlan: .stateExtraction
         }
     }
 
@@ -795,10 +819,22 @@ private extension NovelStructuredModelTask {
                 .init(role: .system, content: system),
                 .init(role: .user, content: "WHOLE-CHAPTER CANDIDATE\n" + candidate),
             ]
-        case .chapterPlanProposal(let context):
+        case .chapterPlanProposal(let context),
+             .batchSkeleton(let context),
+             .volumePlan(let context):
             return [
                 .init(role: .system, content: prompt.systemText),
                 .init(role: .user, content: context),
+            ]
+        case .chapterPacing(let context, let chapter):
+            return [
+                .init(role: .system, content: prompt.systemText + "\n\n" + context),
+                .init(role: .user, content: "CHAPTER UNDER REVIEW\n" + chapter),
+            ]
+        case .batchSkeletonReview(let context, let skeleton):
+            return [
+                .init(role: .system, content: prompt.systemText + "\n\n" + context),
+                .init(role: .user, content: "SKELETON UNDER REVIEW\n" + skeleton),
             ]
         case .workspacePlot(let previousSummary, let chapterTitle, let chapterContent):
             let summary = previousSummary.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -855,6 +891,14 @@ private extension NovelStructuredModelTask {
             )
         case .workspacePlot:
             .workspacePlot(try NovelWorkspacePlotDraft.parse(text))
+        case .chapterPacing:
+            .chapterPacing(try NovelPacingMarkdown.parseChapterPacing(text))
+        case .batchSkeleton:
+            .batchSkeleton(try NovelPacingMarkdown.parseBatchSkeleton(text))
+        case .batchSkeletonReview:
+            .batchSkeletonReview(try NovelPacingMarkdown.parseSkeletonReview(text))
+        case .volumePlan:
+            .volumePlan(try NovelPacingMarkdown.parseVolumePlan(text))
         }
     }
 }
@@ -883,7 +927,8 @@ extension NovelStructuredModelTaskKind {
         case .stateRebuild: 8_192
         case .stateDelta, .discussionArchive, .polishDrift, .continuityAudit,
              .continuityRepair, .chapterPlanAcceptance, .chapterAdjudication,
-             .chapterPlanProposal, .workspacePlot:
+             .chapterPlanProposal, .workspacePlot, .chapterPacing, .batchSkeleton,
+             .batchSkeletonReview, .volumePlan:
             4_096
         }
     }
@@ -916,7 +961,8 @@ extension NovelStructuredModelTaskKind {
                 maxOutputTokens: nil,
                 reasoningLevel: .automatic
             )
-        case .workspacePlot, .chapterPlanProposal:
+        case .workspacePlot, .chapterPlanProposal, .chapterPacing, .batchSkeleton,
+             .batchSkeletonReview, .volumePlan:
             .init(
                 temperature: nil,
                 topP: nil,
@@ -932,4 +978,9 @@ extension NovelStructuredModelTaskKind {
             )
         }
     }
+}
+
+
+extension NovelStructuredModelTask {
+    var taskKind: NovelStructuredModelTaskKind { kind }
 }
