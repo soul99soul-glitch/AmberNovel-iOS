@@ -194,6 +194,10 @@ targets:
         buildPhase: resources
       - path: Resources/Licenses/JetBrainsMono-2.304-OFL.txt
         buildPhase: resources
+      - path: Resources/Licenses/PhosphorIcons-core-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/KoboyoIcons-LICENSE.txt
+        buildPhase: resources
       - path: Resources/Licenses/Apache-2.0-standard.txt
         buildPhase: resources
       - path: Resources/Licenses/MPL-2.0-standard.txt

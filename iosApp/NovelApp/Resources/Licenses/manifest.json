@@ -42,6 +42,8 @@
   {"title": "Noto Serif SC", "licenseType": "OFL-1.1", "file": "NotoSerifSC-2.003-OFL.txt"},
   {"title": "Noto Serif SC COPYRIGHT", "file": "NotoSerifSC-2.003-COPYRIGHT.txt"},
   {"title": "JetBrains Mono", "licenseType": "OFL-1.1", "file": "JetBrainsMono-2.304-OFL.txt"},
+  {"title": "Phosphor Icons（fill，@phosphor-icons/core）", "licenseType": "MIT", "file": "PhosphorIcons-core-LICENSE.txt"},
+  {"title": "Koboyo Icons", "licenseType": "Koboyo Icons license", "file": "KoboyoIcons-LICENSE.txt"},
   {"title": "Apache License 2.0", "licenseType": "Apache-2.0", "file": "Apache-2.0-standard.txt"},
   {"title": "Mozilla Public License 2.0", "licenseType": "MPL-2.0", "file": "MPL-2.0-standard.txt"}
 ]
