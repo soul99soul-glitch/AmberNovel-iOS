@@ -4,6 +4,7 @@ struct NovelAppSettingsView: View {
     let settings: NovelAppSettingsStore
     let onOpenWritingSettings: () -> Void
     let onOpenAppearance: () -> Void
+    let onOpenLicenses: () -> Void
 
     @State private var editingService: NovelModelService?
     @State private var searchKeyDraft = ""
@@ -64,6 +65,25 @@ struct NovelAppSettingsView: View {
             searchSection
 
             NovelBackgroundKeepAliveSection()
+
+            Section {
+                navigationRow("开源许可", systemImage: "doc.text", action: onOpenLicenses)
+                Link(destination: NovelAboutLinks.sourceCode) {
+                    NovelAboutLinkLabel(
+                        title: "源代码",
+                        subtitle: "标签 \(NovelAboutLinks.sourceTag)",
+                        systemImage: "chevron.left.forwardslash.chevron.right"
+                    )
+                }
+                Link(destination: NovelAboutLinks.support) {
+                    NovelAboutLinkLabel(title: "支持", subtitle: nil, systemImage: "questionmark.circle")
+                }
+                Link(destination: NovelAboutLinks.privacy) {
+                    NovelAboutLinkLabel(title: "隐私政策", subtitle: nil, systemImage: "hand.raised")
+                }
+            } header: {
+                Text("关于")
+            }
 
             NovelAboutSection()
         }

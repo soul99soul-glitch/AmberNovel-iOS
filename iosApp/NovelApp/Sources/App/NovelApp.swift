@@ -16,6 +16,8 @@ enum NovelAppRoute: Hashable {
     case settings
     case writingSettings
     case appearance
+    case licenses
+    case licenseDetail(NovelLicenseEntry)
 }
 
 /// App-level owners. Mirrors AmberAgent's `AppShell` wiring for the Novel
@@ -179,10 +181,15 @@ struct NovelRootView: View {
             NovelAppSettingsView(
                 settings: model.settings,
                 onOpenWritingSettings: { model.navigate(to: .writingSettings) },
-                onOpenAppearance: { model.navigate(to: .appearance) }
+                onOpenAppearance: { model.navigate(to: .appearance) },
+                onOpenLicenses: { model.navigate(to: .licenses) }
             )
         case .appearance:
             NovelAppearanceView()
+        case .licenses:
+            NovelLicensesView(onOpenEntry: { model.navigate(to: .licenseDetail($0)) })
+        case .licenseDetail(let entry):
+            NovelLicenseDetailView(entry: entry)
         case .writingSettings:
             if let viewModel = model.creationViewModel {
                 NovelCreationSettingsView(sharedSettings: model.settings, viewModel: viewModel)

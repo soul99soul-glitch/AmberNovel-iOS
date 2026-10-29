@@ -106,6 +106,98 @@ targets:
         buildPhase: resources
       - path: ../Resources/Fonts/jetbrains_mono.ttf
         buildPhase: resources
+      - path: Resources/Licenses/manifest.json
+        buildPhase: resources
+      - path: Resources/Licenses/AmberNovel-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/GNU-AGPL-3.0-standard.txt
+        buildPhase: resources
+      - path: Resources/Licenses/Kotlin-2.3.21-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/Kotlin-2.3.21-NOTICE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/Kotlin-2.3.21-third-party-README.txt
+        buildPhase: resources
+      - path: Resources/Licenses/Kotlin-2.3.21-boost_LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/Kotlin-2.3.21-threetenbp_license.txt
+        buildPhase: resources
+      - path: Resources/Licenses/Kotlin-Native-2.3.21-utfcpp-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/Kotlin-Native-2.3.21-libbacktrace_LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/kotlinx.coroutines-1.10.2-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/kotlinx.serialization-1.11.0-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/kotlinx-datetime-0.7.1-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/kotlinx-io-0.8.2-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/atomicfu-0.32.1-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/Ktor-3.4.3-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/AndroidX-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/SQLite-3.46.0-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/Rust-1.86.0-LICENSE-MIT.txt
+        buildPhase: resources
+      - path: Resources/Licenses/Rust-1.86.0-COPYRIGHT.txt
+        buildPhase: resources
+      - path: Resources/Licenses/RustCrates-summary.txt
+        buildPhase: resources
+      - path: Resources/Licenses/RustCrates-license-texts.txt
+        buildPhase: resources
+      - path: Resources/Licenses/tiktoken-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/SwiftNIO-2.101.3-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/SwiftNIO-2.101.3-NOTICE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/SwiftAtomics-1.3.1-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/SwiftCollections-1.6.0-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/ChatLayout-2.4.2-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/SwiftStreamingMarkdown-vendored-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/Equatable-1.0.10-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/SwiftMarkdown-0.7.3-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/SwiftMarkdown-0.7.3-NOTICE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/SwiftCmark-0.8.0-COPYING.txt
+        buildPhase: resources
+      - path: Resources/Licenses/HighlightSwift-99c431b-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/highlight.js-11.9.0-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/iosMath-066ba2f-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/iosMath-066ba2f-XITS-Math-OFL.txt
+        buildPhase: resources
+      - path: Resources/Licenses/iosMath-066ba2f-GUST-FONT-LICENSE.txt
+        buildPhase: resources
+      - path: Resources/Licenses/iosMath-066ba2f-README-Latin-Modern-Math.txt
+        buildPhase: resources
+      - path: Resources/Licenses/iosMath-066ba2f-README-TeX-Gyre-Termes-Math.txt
+        buildPhase: resources
+      - path: Resources/Licenses/LPPL-1.3c-standard.txt
+        buildPhase: resources
+      - path: Resources/Licenses/NotoSerifSC-2.003-OFL.txt
+        buildPhase: resources
+      - path: Resources/Licenses/NotoSerifSC-2.003-COPYRIGHT.txt
+        buildPhase: resources
+      - path: Resources/Licenses/JetBrainsMono-2.304-OFL.txt
+        buildPhase: resources
+      - path: Resources/Licenses/Apache-2.0-standard.txt
+        buildPhase: resources
+      - path: Resources/Licenses/MPL-2.0-standard.txt
+        buildPhase: resources
       - path: ../iosApp/Localizable.xcstrings
     settings:
       base:
