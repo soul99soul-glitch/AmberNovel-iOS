@@ -422,7 +422,6 @@ final class NovelLiveModelAdapterTests: XCTestCase {
         let request = try XCTUnwrap(captured.value)
         XCTAssertTrue(request.parameters.tools.isEmpty)
         XCTAssertTrue(request.parameters.model.tools.isEmpty)
-        XCTAssertNil(request.grokIsolation)
         XCTAssertEqual(request.parameters.reasoningLevel.name.lowercased(), "high")
         XCTAssertEqual(request.messages.map(\.role), [.system, .user])
         XCTAssertEqual(request.messages.map { $0.toText() }, ["仅使用小说上下文。", "继续写。"])
@@ -879,109 +878,56 @@ final class NovelLiveModelAdapterTests: XCTestCase {
             Set(captured.value?.parameters.tools.map(\.name) ?? []),
             Set(["ask_user", "search_web", "scrape_web"] + novelDiscussionProjectToolNames)
         )
-        XCTAssertNil(captured.value?.grokIsolation)
     }
 
-    func testGrokDispatchSelectsTheIsolatedNovelTransport() async throws {
-        let model = makeModel(modelID: "grok-4.20-fast")
-        let provider = ProviderSetting.OpenAI(
-            id: KotlinUuid.companion.random(),
-            enabled: true,
-            name: "Grok Web",
-            models: [model],
-            balanceOption: BalanceOption(enabled: false, apiPath: "", resultPath: ""),
-            builtIn: false,
-            descriptionText: nil,
-            shortDescriptionText: nil,
-            apiKey: "",
-            baseUrl: IOSGrokWebConstants.webBaseUrl,
-            chatCompletionsPath: "/chat/completions",
-            useResponseApi: false,
-            authMode: OpenAIAuthMode.apiKey,
-            brand: OpenAIBrand.generic
-        )
-        let providerID = IOSGrokWebProviderResolver.providerKey(provider)
-        guard IOSGrokWebAuthStore.save(
-            providerId: providerID,
-            cookieHeader: "sso=novel-test-session"
-        ) else {
-            throw XCTSkip("Simulator keychain is unavailable.")
-        }
-        defer { IOSGrokWebAuthStore.clear(providerId: providerID) }
+    func testLegacyAccountLoginProvidersReadAsNotConfigured() async throws {
+        // Grok / Codex account sign-in was removed. Providers still saved in
+        // those modes must fail as "missing API key" before any transport runs.
+        let model = makeModel(modelID: "legacy-model")
+        let legacy: [(String, OpenAIAuthMode)] = [
+            ("https://grok.com/rest/app-chat", OpenAIAuthMode.apiKey),
+            ("https://cli-chat-proxy.grok.com/v1", OpenAIAuthMode.apiKey),
+            ("https://chatgpt.com/backend-api/codex", OpenAIAuthMode.codexOauth),
+        ]
+        for (baseUrl, authMode) in legacy {
+            let provider = ProviderSetting.OpenAI(
+                id: KotlinUuid.companion.random(),
+                enabled: true,
+                name: "Legacy login",
+                models: [model],
+                balanceOption: BalanceOption(enabled: false, apiPath: "", resultPath: ""),
+                builtIn: false,
+                descriptionText: nil,
+                shortDescriptionText: nil,
+                apiKey: "stale-value",
+                baseUrl: baseUrl,
+                chatCompletionsPath: "/chat/completions",
+                useResponseApi: false,
+                authMode: authMode,
+                brand: OpenAIBrand.generic
+            )
+            XCTAssertTrue(IOSLegacyAccountLogin.isLegacyLogin(provider), baseUrl)
+            XCTAssertFalse(ChatProviderConfiguration.hasUsableCredential(provider), baseUrl)
+            XCTAssertEqual(ChatProviderConfiguration.credentialStatusTitle(provider), "未填写", baseUrl)
 
-        let captured = LockedBox<NovelLiveTransportRequest?>(nil)
-        let kmpCalls = LockedBox(0)
-        let adapter = NovelLiveModelAdapter(
-            catalogProvider: {
-                NovelLiveModelCatalog(currentModel: model, providers: [provider])
-            },
-            kmpTransport: { _, _ in
-                kmpCalls.mutate { $0 += 1 }
-                return nil
-            },
-            grokTransport: { request, callbacks in
-                captured.set(request)
-                callbacks.onComplete()
-                return nil
+            let calls = LockedBox(0)
+            let adapter = NovelLiveModelAdapter(
+                catalogProvider: {
+                    NovelLiveModelCatalog(currentModel: model, providers: [provider])
+                },
+                kmpTransport: { _, _ in
+                    calls.mutate { $0 += 1 }
+                    return nil
+                }
+            )
+            do {
+                _ = try await adapter.resolveModel(for: .global)
+                XCTFail("Expected legacy login provider to read as not configured: \(baseUrl)")
+            } catch let failure as NovelModelFailure {
+                XCTAssertEqual(failure.code, "configuration_missing_api_key", baseUrl)
             }
-        )
-
-        let resolved = try await adapter.resolveModel(for: .global)
-        let events = await Self.collect(try await adapter.start(makeRequest(model: resolved)))
-
-        XCTAssertEqual(events, [.completed])
-        XCTAssertEqual(kmpCalls.value, 0)
-        XCTAssertEqual(captured.value?.grokIsolation, .novel)
-        XCTAssertTrue(captured.value?.providerSetting is ProviderSetting.OpenAI)
-    }
-
-    func testGrokDiscussionEnablesChatSearchWhileKeepingMemoryIsolated() async throws {
-        let model = makeModel(modelID: "grok-4.20-fast")
-        let provider = ProviderSetting.OpenAI(
-            id: KotlinUuid.companion.random(),
-            enabled: true,
-            name: "Grok Web",
-            models: [model],
-            balanceOption: BalanceOption(enabled: false, apiPath: "", resultPath: ""),
-            builtIn: false,
-            descriptionText: nil,
-            shortDescriptionText: nil,
-            apiKey: "",
-            baseUrl: IOSGrokWebConstants.webBaseUrl,
-            chatCompletionsPath: "/chat/completions",
-            useResponseApi: false,
-            authMode: OpenAIAuthMode.apiKey,
-            brand: OpenAIBrand.generic
-        )
-        let providerID = IOSGrokWebProviderResolver.providerKey(provider)
-        guard IOSGrokWebAuthStore.save(
-            providerId: providerID,
-            cookieHeader: "sso=novel-discussion-test-session"
-        ) else {
-            throw XCTSkip("Simulator keychain is unavailable.")
+            XCTAssertEqual(calls.value, 0, baseUrl)
         }
-        defer { IOSGrokWebAuthStore.clear(providerId: providerID) }
-
-        let captured = LockedBox<NovelLiveTransportRequest?>(nil)
-        let adapter = NovelLiveModelAdapter(
-            catalogProvider: {
-                NovelLiveModelCatalog(currentModel: model, providers: [provider])
-            },
-            kmpTransport: { _, _ in nil },
-            grokTransport: { request, callbacks in
-                captured.set(request)
-                callbacks.onComplete()
-                return nil
-            }
-        )
-
-        let resolved = try await adapter.resolveModel(for: .global)
-        _ = await Self.collect(try await adapter.start(makeRequest(
-            model: resolved,
-            purpose: .discussion
-        )))
-
-        XCTAssertEqual(captured.value?.grokIsolation, .discussion)
     }
 
     func testSynchronousTerminalBeforeHandleInstallationDoesNotTurnStartIntoFailure() async throws {

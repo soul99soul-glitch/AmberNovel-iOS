@@ -6,33 +6,10 @@ struct NovelLiveModelCatalog: @unchecked Sendable {
     let providers: [ProviderSetting]
 }
 
-struct NovelGrokIsolationOptions: Equatable, Sendable {
-    let disableSearch: Bool
-    let disableMemory: Bool
-
-    static let novel = NovelGrokIsolationOptions(
-        disableSearch: true,
-        disableMemory: true
-    )
-
-    static let discussion = NovelGrokIsolationOptions(
-        disableSearch: false,
-        disableMemory: true
-    )
-
-    static func forPurpose(
-        _ purpose: NovelModelPurpose,
-        searchEnabled: Bool
-    ) -> NovelGrokIsolationOptions {
-        purpose == .discussion && searchEnabled ? .discussion : .novel
-    }
-}
-
 struct NovelLiveTransportRequest: @unchecked Sendable {
     let providerSetting: ProviderSetting
     let messages: [UIMessage]
     let parameters: TextGenerationParams
-    let grokIsolation: NovelGrokIsolationOptions?
     /// Discussion-only: owning project + current branch for the novel project
     /// write tools. Nil for every other purpose — zero impact on non-discussion
     /// transports.
@@ -42,13 +19,11 @@ struct NovelLiveTransportRequest: @unchecked Sendable {
         providerSetting: ProviderSetting,
         messages: [UIMessage],
         parameters: TextGenerationParams,
-        grokIsolation: NovelGrokIsolationOptions?,
         novelProjectContext: NovelProjectToolRunContext? = nil
     ) {
         self.providerSetting = providerSetting
         self.messages = messages
         self.parameters = parameters
-        self.grokIsolation = grokIsolation
         self.novelProjectContext = novelProjectContext
     }
 }
@@ -117,34 +92,16 @@ struct NovelLiveCodexHooks: @unchecked Sendable {
     let augment: @Sendable (TextGenerationParams, ProviderSetting) -> TextGenerationParams
     let diagnose: @Sendable (ProviderSetting, ProviderSetting, TextGenerationParams) -> Void
 
-    static let production = NovelLiveCodexHooks(
-        isCodex: { IOSCodexProviderResolver.isCodexProvider($0) },
-        resolve: {
-            try await IOSGrokWebProviderResolver.resolved(
-                try await IOSCodexProviderResolver.resolved($0)
-            )
-        },
-        augment: { params, provider in
-            IOSGrokWebProviderResolver.augmentParamsForGrok(
-                IOSCodexProviderResolver.augmentParamsForCodex(params, provider: provider),
-                provider: provider
-            )
-        },
-        diagnose: {
-            IOSCodexProviderResolver.writeRequestDiagnostic(
-                originalProvider: $0,
-                resolvedProvider: $1,
-                params: $2
-            )
-        }
-    )
-
     static let passthrough = NovelLiveCodexHooks(
         isCodex: { _ in false },
         resolve: { $0 },
         augment: { parameters, _ in parameters },
         diagnose: { _, _, _ in }
     )
+
+    /// Codex / Grok account sign-in was removed from this app: production
+    /// requests use the saved API-key provider as-is.
+    static let production = passthrough
 }
 
 /// The production bridge from the Novel domain request to the existing provider
@@ -173,7 +130,6 @@ actor NovelLiveModelAdapter: NovelDurableModelRunning {
     private let durableStartTransport: NovelLiveTransport?
     private let durableResumeTransport: NovelDurableResumeTransport?
     private let discussionSearchEnabled: @Sendable () async -> Bool
-    private let grokTransport: NovelLiveTransport
     private let geminiTransport: NovelLiveTransport
     private let codex: NovelLiveCodexHooks
 
@@ -188,7 +144,6 @@ actor NovelLiveModelAdapter: NovelDurableModelRunning {
         sharedSettings: any IOSSettingsSnapshotSource,
         streamingProvider: any IOSAgentTextProvider & IOSAgentStreamingProvider = OpenAIKmpProviderAdapter(),
         toolRuntime: (any NovelDiscussionToolHost)? = nil,
-        grokTransport: NovelLiveTransport? = nil,
         geminiTransport: NovelLiveTransport? = nil
     ) {
         let settingsSource = NovelSharedSettingsSource(sharedSettings)
@@ -209,7 +164,6 @@ actor NovelLiveModelAdapter: NovelDurableModelRunning {
         self.discussionSearchEnabled = {
             await settingsSource.webSearchEnabled()
         }
-        self.grokTransport = grokTransport ?? Self.productionGrokTransport
         self.geminiTransport = geminiTransport ?? Self.productionGeminiTransport
         self.codex = .production
     }
@@ -221,7 +175,6 @@ actor NovelLiveModelAdapter: NovelDurableModelRunning {
         durableStartTransport: NovelLiveTransport? = nil,
         durableResumeTransport: NovelDurableResumeTransport? = nil,
         discussionSearchEnabled: @escaping @Sendable () async -> Bool = { true },
-        grokTransport: NovelLiveTransport? = nil,
         geminiTransport: NovelLiveTransport? = nil,
         codex: NovelLiveCodexHooks = .passthrough
     ) {
@@ -231,7 +184,6 @@ actor NovelLiveModelAdapter: NovelDurableModelRunning {
         self.durableStartTransport = durableStartTransport
         self.durableResumeTransport = durableResumeTransport
         self.discussionSearchEnabled = discussionSearchEnabled
-        self.grokTransport = grokTransport ?? Self.isolatedGrokUnavailableTransport
         self.geminiTransport = geminiTransport ?? Self.isolatedGeminiUnavailableTransport
         self.codex = codex
     }
@@ -276,28 +228,20 @@ actor NovelLiveModelAdapter: NovelDurableModelRunning {
 
             let effectiveProvider = try await codex.resolve(route.provider)
             try ensureRunStillActive(request.runID)
-            let isGrokWeb = {
-                guard let openAI = effectiveProvider as? ProviderSetting.OpenAI else { return false }
-                return IOSGrokWebProviderResolver.isGrokWebConfiguration(openAI)
-            }()
             let isGemini = IOSGeminiProviderResolver.isGeminiProvider(effectiveProvider)
-            let usesOpenAIStyleToolLoop = !isGrokWeb
             let userEnabledSearch: Bool
             if request.purpose == .discussion {
                 userEnabledSearch = await discussionSearchEnabled()
             } else {
                 userEnabledSearch = false
             }
-            let searchEnabled = userEnabledSearch
-                && (isGrokWeb || discussionTransport != nil)
+            let searchEnabled = userEnabledSearch && discussionTransport != nil
             try ensureRunStillActive(request.runID)
             let messages = Self.makeMessages(request.messages)
-            // Grok Web 走原生传输，不把 OpenAI 风格工具声明塞进去。
             // Gemini 讨论可以走同一套工具循环：原生 client 已能发 functionDeclarations。
             let usesDiscussionToolLoop =
                 (request.purpose == .discussion || request.purpose == .quickStart) &&
-                discussionTransport != nil &&
-                usesOpenAIStyleToolLoop
+                discussionTransport != nil
             let novelProjectContext: NovelProjectToolRunContext? =
                 request.purpose == .discussion && usesDiscussionToolLoop
                 ? request.projectID.flatMap { projectID in
@@ -333,10 +277,6 @@ actor NovelLiveModelAdapter: NovelDurableModelRunning {
                 providerSetting: effectiveProvider,
                 messages: messages,
                 parameters: parameters,
-                grokIsolation: isGrokWeb ? .forPurpose(
-                    request.purpose,
-                    searchEnabled: searchEnabled
-                ) : nil,
                 novelProjectContext: novelProjectContext
             )
             let useDurableTransport = Self.usesBackgroundResponses(
@@ -344,9 +284,7 @@ actor NovelLiveModelAdapter: NovelDurableModelRunning {
                 purpose: request.purpose
             ) && durableStartTransport != nil
             let transport: NovelLiveTransport
-            if isGrokWeb {
-                transport = grokTransport
-            } else if usesDiscussionToolLoop, let discussionTransport {
+            if usesDiscussionToolLoop, let discussionTransport {
                 transport = discussionTransport
             } else if isGemini {
                 transport = geminiTransport
@@ -594,7 +532,7 @@ actor NovelLiveModelAdapter: NovelDurableModelRunning {
            !IOSGeminiProviderResolver.supportsChat(google) {
             throw Self.failure(
                 code: Self.configurationCode(.unsupportedProvider),
-                message: "当前 Gemini 认证方式在 iOS 上尚未支持，请使用 API Key 或 Antigravity 登录。"
+                message: "当前 Gemini 认证方式在 iOS 上尚未支持，请改用你自己的 API Key。"
             )
         }
 
@@ -743,67 +681,6 @@ private extension NovelLiveModelAdapter {
         isRetryable: false
     )
 
-    static let isolatedGrokUnavailableTransport: NovelLiveTransport = { request, callbacks in
-        guard request.grokIsolation != nil else {
-            callbacks.onFailure(failure(
-                code: "grok_isolation_missing",
-                message: "Grok Web 小说请求缺少隔离选项。"
-            ))
-            return nil
-        }
-        callbacks.onFailure(failure(
-            code: "grok_isolation_unavailable",
-            message: "当前 Grok Web 运行时还不能关闭网页搜索与网页记忆，请先改用 OpenAI、Claude 或 Codex 模型。"
-        ))
-        return nil
-    }
-
-    static let productionGrokTransport: NovelLiveTransport = { request, callbacks in
-        guard let isolation = request.grokIsolation else {
-            callbacks.onFailure(failure(
-                code: "grok_isolation_missing",
-                message: "Grok Web 小说请求缺少隔离选项。"
-            ))
-            return nil
-        }
-        guard let openAI = request.providerSetting as? ProviderSetting.OpenAI else {
-            callbacks.onFailure(failure(
-                code: "grok_provider_invalid",
-                message: "Grok Web 小说请求的服务商配置无效。"
-            ))
-            return nil
-        }
-
-        let task = Task { @MainActor in
-            do {
-                let providerID = IOSGrokWebProviderResolver.providerKey(openAI)
-                try await IOSGrokWebClient(providerId: providerID).streamText(
-                    messages: request.messages,
-                    params: request.parameters,
-                    options: IOSGrokWebRequestOptions(
-                        disableSearch: isolation.disableSearch,
-                        disableMemory: isolation.disableMemory
-                    ),
-                    onChunk: callbacks.onChunk
-                )
-                guard !Task.isCancelled else { return }
-                callbacks.onComplete()
-            } catch is CancellationError {
-                return
-            } catch {
-                guard !Task.isCancelled else { return }
-                callbacks.onFailure(NovelModelFailure(
-                    code: "grok_web_stream_failed",
-                    message: (error as NSError).localizedDescription,
-                    isRetryable: true
-                ))
-            }
-        }
-        return NovelLiveCancellationHandle {
-            task.cancel()
-        }
-    }
-
     static let isolatedGeminiUnavailableTransport: NovelLiveTransport = { request, callbacks in
         guard request.providerSetting is ProviderSetting.Google else {
             callbacks.onFailure(failure(
@@ -830,7 +707,7 @@ private extension NovelLiveModelAdapter {
         guard IOSGeminiProviderResolver.supportsChat(google) else {
             callbacks.onFailure(failure(
                 code: "gemini_unsupported_auth",
-                message: "当前 Gemini 认证方式在 iOS 上尚未支持，请使用 API Key 或 Antigravity 登录。",
+                message: "当前 Gemini 认证方式在 iOS 上尚未支持，请改用你自己的 API Key。",
                 isRetryable: false
             ))
             return nil
@@ -1682,9 +1559,6 @@ private extension NovelLiveModelAdapter {
         case .missingProvider: "configuration_missing_provider"
         case .providerDisabled: "configuration_provider_disabled"
         case .unsupportedProvider: "configuration_unsupported_provider"
-        case .codexNotSignedIn: "configuration_codex_not_signed_in"
-        case .grokNotSignedIn: "configuration_grok_not_signed_in"
-        case .geminiNotSignedIn: "configuration_gemini_not_signed_in"
         }
     }
 

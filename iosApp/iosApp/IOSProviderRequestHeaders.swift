@@ -152,7 +152,6 @@ enum IOSProviderRequestHeaderStore {
 
 enum ProviderUserAgentPreset: String, CaseIterable, Identifiable {
     case opencode
-    case claudeCode
     case cursor
     case cline
     case custom
@@ -162,7 +161,6 @@ enum ProviderUserAgentPreset: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .opencode: "OpenCode"
-        case .claudeCode: "Claude Code"
         case .cursor: "Cursor"
         case .cline: "Cline"
         case .custom: "自定义"
@@ -172,7 +170,6 @@ enum ProviderUserAgentPreset: String, CaseIterable, Identifiable {
     var userAgent: String? {
         switch self {
         case .opencode: OpenAICompatUserAgents.shared.OPENCODE
-        case .claudeCode: OpenAICompatUserAgents.shared.CLAUDE_CODE
         case .cursor: OpenAICompatUserAgents.shared.CURSOR
         case .cline: OpenAICompatUserAgents.shared.CLINE
         case .custom: nil

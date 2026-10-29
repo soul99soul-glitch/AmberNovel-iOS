@@ -3,34 +3,17 @@ import Foundation
 
 /// Native Swift Gemini provider for iOS.
 ///
-/// Two auth routes, both speaking Google's GenerateContent SSE protocol:
-///  - **API Key**: `x-goog-api-key` against `{baseUrl}/models/{model}:streamGenerateContent?alt=sse`
-///    (Generative Language API).
-///  - **Antigravity OAuth**: Bearer against
-///    `cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse`, with the
-///    Antigravity agent wrapper (`userAgent` / `requestType` / `requestId` / `request`).
-///    Token resolution + onboarding lives in `IOSAntigravityOAuthClient`.
+/// API Key route only: `x-goog-api-key` against
+/// `{baseUrl}/models/{model}:streamGenerateContent?alt=sse` (Generative Language API).
+/// Providers saved in the removed Antigravity OAuth mode read as not configured.
 ///
 /// Vertex AI + service-account mode is NOT implemented on iOS (JWT signing out of
 /// scope); such providers are kept out of `supportsChat` and fail honestly.
 enum IOSGeminiConstants {
     static let apiKeyDefaultBaseUrl = "https://generativelanguage.googleapis.com/v1beta"
-    static let cloudcodePaBaseUrl = IOSAntigravityOAuthConstants.cloudcodePaBaseUrl
-
-    /// Offline seed when `fetchAvailableModels` is unreachable. Live refresh
-    /// uses `/v1internal:fetchAvailableModels` so newer IDs (3.7 flash, …)
-    /// show up without another app release.
-    static let fallbackModels: [(modelId: String, displayName: String)] = [
-        (modelId: "gemini-3.7-flash", displayName: "Gemini 3.7 Flash"),
-        (modelId: "gemini-3.5-flash", displayName: "Gemini 3.5 Flash"),
-        (modelId: "gemini-3.1-pro", displayName: "Gemini 3.1 Pro"),
-        (modelId: "gemini-3-pro", displayName: "Gemini 3 Pro"),
-        (modelId: "gemini-3-flash", displayName: "Gemini 3 Flash"),
-    ]
 }
 
 enum IOSGeminiError: LocalizedError, Equatable {
-    case notSignedIn
     case missingAPIKey
     case unsupportedAuthMode(String)
     case unsupportedModel(String)
@@ -39,18 +22,16 @@ enum IOSGeminiError: LocalizedError, Equatable {
 
     var errorDescription: String? {
         switch self {
-        case .notSignedIn:
-            return "尚未登录 Antigravity，请先在 Gemini 服务商设置里用 Google 账号登录。"
         case .missingAPIKey:
             return "Gemini 服务商还没有 API Key，请先填写。"
         case .unsupportedAuthMode(let mode):
-            return "当前 Gemini 认证方式（\(mode)）在 iOS 上尚未支持，请切换为 API Key 或 Antigravity 登录。"
+            return "当前 Gemini 认证方式（\(mode)）在 iOS 上尚未支持，请改用你自己的 API Key。"
         case .unsupportedModel(let modelId):
             return "\(modelId) 不是可用的 Gemini 模型，请检查模型 ID。"
         case .httpStatus(let status, let detail):
             if status == 401 || status == 403 {
                 let suffix = detail.isEmpty ? "" : " \(detail)"
-                return "Gemini 凭据未被服务器接受。API Key 模式请检查 Key；Antigravity 模式请重新登录。\(suffix)"
+                return "Gemini 凭据未被服务器接受。请检查 API Key。\(suffix)"
             }
             return detail.isEmpty
                 ? "Gemini 请求失败：HTTP \(status)"
@@ -58,124 +39,6 @@ enum IOSGeminiError: LocalizedError, Equatable {
         case .stream(let message):
             return message
         }
-    }
-}
-
-/// Antigravity's catalog encodes thinking / channel as model-id suffixes
-/// (`-high`, `-tiered`, `-preview`). The picker shows one clean base name;
-/// the send path puts a real catalog id back.
-enum IOSAntigravityModelId {
-    /// Longer tokens first so `extra-low` wins over `low`.
-    static let variantSuffixes = [
-        "extra-low", "low", "medium", "high",
-        "tiered", "preview", "latest",
-    ]
-
-    static func split(_ modelId: String) -> (base: String, variant: String?) {
-        let id = modelId.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lower = id.lowercased()
-        for suffix in variantSuffixes {
-            let token = "-" + suffix
-            if lower.hasSuffix(token) {
-                return (String(id.dropLast(token.count)), suffix)
-            }
-        }
-        return (id, nil)
-    }
-
-    /// `gemini-3.7-flash` → `Gemini 3.7 Flash`. Never keep High / Tiered in the title.
-    static func displayName(forBase base: String) -> String {
-        let parts = base.split(separator: "-").map(String.init)
-        let rest = parts.dropFirst().filter { $0.lowercased() != "gemini" }
-        let titled = rest.map { token -> String in
-            if token.contains(where: \.isNumber) { return token }
-            return token.localizedCapitalized
-        }
-        let name = titled.joined(separator: " ")
-        return name.isEmpty ? "Gemini" : "Gemini \(name)"
-    }
-
-    static func wantedVariant(for level: ReasoningLevel) -> String? {
-        switch level {
-        case .off:
-            return nil
-        case .low:
-            return "low"
-        case .medium:
-            return "medium"
-        case .auto_:
-            return "tiered"
-        case .high, .xhigh, .max:
-            return "high"
-        default:
-            return "high"
-        }
-    }
-
-    static func preference(for wanted: String?) -> [String] {
-        switch wanted {
-        case nil:
-            return ["", "low", "extra-low", "tiered", "medium", "high", "preview"]
-        case "tiered":
-            return ["tiered", "", "high", "medium", "low", "extra-low", "preview"]
-        case "high":
-            return ["high", "tiered", "medium", "low", "extra-low", "", "preview"]
-        case "medium":
-            return ["medium", "high", "tiered", "low", "extra-low", "", "preview"]
-        case "low":
-            return ["low", "extra-low", "medium", "tiered", "high", "", "preview"]
-        default:
-            return [wanted ?? "", "tiered", "", "high", "medium", "low", "preview"]
-        }
-    }
-
-    static func wireModelId(
-        _ modelId: String,
-        reasoning: ReasoningLevel,
-        variants: [String: Set<String>]
-    ) -> String {
-        let (base, _) = split(modelId)
-        let available = variants[base] ?? []
-        return pick(base: base, wanted: wantedVariant(for: reasoning), available: available)
-    }
-
-    static func pick(base: String, wanted: String?, available: Set<String>) -> String {
-        func resolve(_ variant: String?) -> String {
-            guard let variant, !variant.isEmpty else { return base }
-            return "\(base)-\(variant)"
-        }
-        if available.isEmpty {
-            // Never invent `-medium` / `-tiered` without a live catalog.
-            // cloudcode-pa 404s GA names *and* guessed suffixes.
-            return base
-        }
-        if let match = preference(for: wanted).first(where: { available.contains($0) }) {
-            return resolve(match.isEmpty ? nil : match)
-        }
-        return resolve(wanted)
-    }
-}
-
-enum IOSAntigravityModelVariants {
-    private static let defaultsKey = "amber.antigravity.modelVariants"
-
-    nonisolated(unsafe) static var effortsByBase: [String: Set<String>] = load()
-
-    static func replace(_ grouped: [String: Set<String>]) {
-        effortsByBase = grouped
-        let encoded = Dictionary(uniqueKeysWithValues: grouped.map { key, value in
-            (key, Array(value))
-        })
-        UserDefaults.standard.set(encoded, forKey: defaultsKey)
-    }
-
-    static func load() -> [String: Set<String>] {
-        guard let raw = UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: [String]] else {
-            return [:]
-        }
-        return Dictionary(uniqueKeysWithValues: raw.map { key, value in
-            (key, Set(value))
-        })
     }
 }
 
@@ -188,21 +51,17 @@ enum IOSGeminiProviderResolver {
         provider is ProviderSetting.Google
     }
 
+    /// Legacy Antigravity Google sign-in. Removed from this app; such providers
+    /// read as not configured until the user switches to their own API key.
     static func isAntigravityOAuth(_ google: ProviderSetting.Google) -> Bool {
         google.authMode == GoogleAuthMode.antigravityOauth
     }
 
-    static func isSignedIn(_ provider: ProviderSetting) -> Bool {
-        guard let google = provider as? ProviderSetting.Google, isAntigravityOAuth(google) else { return false }
-        return IOSAntigravityAuthStore.load(providerId: providerKey(google)) != nil
-    }
-
     /// Whether the iOS chat chain can run this Gemini provider.
-    /// API_KEY (non-Vertex) and ANTIGRAVITY_OAUTH qualify; Vertex/service-account
+    /// Only API_KEY (non-Vertex) qualifies; legacy Antigravity, Vertex/service-account
     /// and the Android-only Code Assist OAuth mode do not.
     static func supportsChat(_ provider: ProviderSetting) -> Bool {
         guard let google = provider as? ProviderSetting.Google else { return false }
-        if isAntigravityOAuth(google) { return true }
         return google.authMode == GoogleAuthMode.apiKey && !google.vertexAI
     }
 }
@@ -367,10 +226,7 @@ enum IOSGeminiPayloadBuilder {
         hasReasoningAbility || isThinkingModel(modelId)
     }
 
-    static func generationConfig(
-        params: TextGenerationParams,
-        includeThinkingConfig: Bool = true
-    ) -> [String: Any] {
+    static func generationConfig(params: TextGenerationParams) -> [String: Any] {
         var config: [String: Any] = [:]
         if let temperature = params.temperature { config["temperature"] = temperature.floatValue }
         if let topP = params.topP { config["topP"] = topP.floatValue }
@@ -383,38 +239,31 @@ enum IOSGeminiPayloadBuilder {
             modelId: params.model.modelId,
             hasReasoningAbility: params.model.abilities.contains(ModelAbility.reasoning)
         ) {
-            if includeThinkingConfig {
-                let thinking = ReasoningWireKt.geminiThinkingConfig(
-                    modelId: params.model.modelId,
-                    level: params.reasoningLevel
-                )
-                var thinkingConfig: [String: Any] = ["includeThoughts": thinking.includeThoughts]
-                if let level = thinking.thinkingLevel {
-                    thinkingConfig["thinkingLevel"] = level
-                }
-                if let budget = thinking.thinkingBudget {
-                    thinkingConfig["thinkingBudget"] = budget.intValue
-                }
-                config["thinkingConfig"] = thinkingConfig
-            } else {
-                // Antigravity encodes the thinking *level* in the model suffix.
-                // includeThoughts still has to be on or 3.7 keeps thoughts internal.
-                config["thinkingConfig"] = ["includeThoughts": true]
+            let thinking = ReasoningWireKt.geminiThinkingConfig(
+                modelId: params.model.modelId,
+                level: params.reasoningLevel
+            )
+            var thinkingConfig: [String: Any] = ["includeThoughts": thinking.includeThoughts]
+            if let level = thinking.thinkingLevel {
+                thinkingConfig["thinkingLevel"] = level
             }
+            if let budget = thinking.thinkingBudget {
+                thinkingConfig["thinkingBudget"] = budget.intValue
+            }
+            config["thinkingConfig"] = thinkingConfig
         }
         return config
     }
 
     static func makeBody(
         messages: [UIMessage],
-        params: TextGenerationParams,
-        includeThinkingConfig: Bool = true
+        params: TextGenerationParams
     ) -> [String: Any] {
         var body: [String: Any] = [:]
         if let system = systemInstruction(from: messages) {
             body["systemInstruction"] = system
         }
-        let generation = generationConfig(params: params, includeThinkingConfig: includeThinkingConfig)
+        let generation = generationConfig(params: params)
         if !generation.isEmpty {
             body["generationConfig"] = generation
         }
@@ -432,33 +281,6 @@ enum IOSGeminiPayloadBuilder {
             }
         }
         return body
-    }
-
-    /// Antigravity cloudcode-pa wrapper. The Gemini CLI `{user_prompt_id, request}`
-    /// shape is accepted by OAuth/onboard but chat is 429 RESOURCE_EXHAUSTED unless
-    /// the body looks like official Antigravity agent traffic
-    /// (`userAgent` + `requestType` + `requestId` + `request.sessionId`).
-    static func makeCloudCodeAssistWrapper(
-        modelId: String,
-        projectId: String,
-        inner: [String: Any]
-    ) -> [String: Any] {
-        var request = inner
-        if request["sessionId"] == nil {
-            request["sessionId"] = antigravitySessionID()
-        }
-        return [
-            "model": modelId,
-            "project": projectId,
-            "userAgent": "antigravity",
-            "requestType": "agent",
-            "requestId": "agent-\(UUID().uuidString)",
-            "request": request,
-        ]
-    }
-
-    static func antigravitySessionID() -> String {
-        "-\(UInt64.random(in: 1_000_000_000_000_000...8_999_999_999_999_999_999))"
     }
 
     private static func parseJSON(_ raw: String) -> Any {
@@ -627,7 +449,7 @@ private struct UncheckedGeminiJSONBox: @unchecked Sendable {
 }
 
 /// Executes Gemini chat calls. Pure URLSession (no WebView), so it also runs on
-/// the background executor. MainActor-isolated like `IOSGrokWebClient` so the
+/// the background executor. MainActor-isolated so the
 /// chat coordinator can hand it non-Sendable message arrays.
 @MainActor
 final class IOSGeminiClient {
@@ -834,22 +656,8 @@ final class IOSGeminiClient {
 
     // MARK: models
 
-    /// API-Key route lists from `GET {baseUrl}/models`. Antigravity lists from
-    /// `POST /v1internal:fetchAvailableModels` (the generative-language ListModels
-    /// path 403s on this token). If the live catalog is empty, fall back to the
-    /// bundled seed so "refresh models" still has something to write.
+    /// API-Key route lists from `GET {baseUrl}/models`.
     func listModelsOrThrow() async throws -> [Model] {
-        if IOSGeminiProviderResolver.isAntigravityOAuth(provider) {
-            let live = try await fetchAntigravityModels()
-            if !live.isEmpty { return live }
-            return IOSGeminiConstants.fallbackModels.map { item in
-                Self.model(
-                    item.modelId,
-                    displayName: item.displayName,
-                    abilities: [ModelAbility.reasoning, ModelAbility.tool]
-                )
-            }
-        }
         let accessKey = provider.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !accessKey.isEmpty else { throw IOSGeminiError.missingAPIKey }
         let base = provider.baseUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -881,161 +689,29 @@ final class IOSGeminiClient {
         }
     }
 
-    private func fetchAntigravityModels() async throws -> [Model] {
-        let token = try await resolveOAuthSessionToken()
-        guard let url = URL(string: IOSGeminiConstants.cloudcodePaBaseUrl + "/v1internal:fetchAvailableModels") else {
-            throw IOSGeminiError.stream("Gemini 模型地址无效。")
-        }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(token.accessToken)", forHTTPHeaderField: "Authorization")
-        request.setValue(IOSAntigravityOAuthConstants.userAgent, forHTTPHeaderField: "User-Agent")
-        request.setValue(IOSAntigravityOAuthConstants.clientMetadata, forHTTPHeaderField: "Client-Metadata")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["project": token.projectId])
-        let (data, response) = try await session.data(for: request)
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard (200..<300).contains(status) else {
-            throw IOSGeminiError.httpStatus(status, Self.httpErrorDetail(data))
-        }
-        return Self.parseAvailableModels(data)
-    }
-
-    /// Parses `fetchAvailableModels` (`models` is a map keyed by id). Drops
-    /// internal / image / agent / alias ids. Thinking and channel suffixes
-    /// (`-high`, `-tiered`, `-preview`) collapse to one pretty base name.
-    static func parseAvailableModels(_ data: Data) -> [Model] {
-        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let catalog = root["models"] as? [String: Any] else {
-            return []
-        }
-        var grouped: [String: Set<String>] = [:]
-        for rawId in catalog.keys {
-            let modelId = rawId.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard isChatCatalogModel(modelId) else { continue }
-            let (base, variant) = IOSAntigravityModelId.split(modelId)
-            guard isChatCatalogModel(base), !isAliasBase(base) else { continue }
-            grouped[base, default: []].insert(variant ?? "")
-        }
-        IOSAntigravityModelVariants.replace(grouped)
-        var models: [Model] = grouped.keys.map { base in
-            Self.model(
-                base,
-                displayName: IOSAntigravityModelId.displayName(forBase: base),
-                abilities: [ModelAbility.reasoning, ModelAbility.tool]
-            )
-        }
-        models.sort { lhs, rhs in
-            let left = catalogSortKey(lhs.modelId)
-            let right = catalogSortKey(rhs.modelId)
-            if left.major != right.major { return left.major > right.major }
-            if left.minor != right.minor { return left.minor > right.minor }
-            if left.kind != right.kind { return left.kind < right.kind }
-            return lhs.modelId < rhs.modelId
-        }
-        return models
-    }
-
-    static func isChatCatalogModel(_ modelId: String) -> Bool {
-        let id = modelId.lowercased()
-        if id.hasPrefix("chat_") || id.hasPrefix("tab_") || id.hasPrefix("rev19") { return false }
-        if id.contains("image") || id.contains("thinking") || id.contains("-agent") { return false }
-        if id.hasPrefix("gemini-2.") { return false }
-        return id.hasPrefix("gemini-")
-    }
-
-    private static func isAliasBase(_ base: String) -> Bool {
-        switch base.lowercased() {
-        case "gemini-flash", "gemini-pro", "gemini-flash-lite":
-            return true
-        default:
-            return false
-        }
-    }
-
-    private static func catalogSortKey(_ modelId: String) -> (major: Int, minor: Int, kind: Int) {
-        let id = modelId.lowercased()
-        var major = 0
-        var minor = 0
-        if let match = id.range(of: #"gemini-(\d+)(?:\.(\d+))?"#, options: .regularExpression) {
-            let digits = id[match].split(whereSeparator: { !$0.isNumber })
-            if let first = digits.first { major = Int(first) ?? 0 }
-            if digits.count > 1 { minor = Int(digits[1]) ?? 0 }
-        }
-        let kind: Int
-        if id.contains("flash-lite") {
-            kind = 1
-        } else if id.contains("flash") {
-            kind = 0
-        } else if id.contains("pro") {
-            kind = 2
-        } else {
-            kind = 3
-        }
-        return (major, minor, kind)
-    }
-
     // MARK: request construction
 
     private func makeStreamRequest(
         messages: [UIMessage],
         params: TextGenerationParams
     ) async throws -> (URLRequest, String) {
-        let inner = IOSGeminiPayloadBuilder.makeBody(
-            messages: messages,
-            params: params,
-            includeThinkingConfig: !IOSGeminiProviderResolver.isAntigravityOAuth(provider)
-        )
-        let url: URL
-        var request: URLRequest
-        var wireModelId = params.model.modelId
-
-        if IOSGeminiProviderResolver.isAntigravityOAuth(provider) {
-            let token = try await resolveOAuthSessionToken()
-            guard let target = URL(string: IOSGeminiConstants.cloudcodePaBaseUrl + "/v1internal:streamGenerateContent?alt=sse") else {
-                throw IOSGeminiError.stream("Gemini 请求地址无效。")
-            }
-            let (base, _) = IOSAntigravityModelId.split(params.model.modelId)
-            if IOSAntigravityModelVariants.effortsByBase[base] == nil {
-                _ = try? await fetchAntigravityModels()
-            }
-            wireModelId = IOSAntigravityModelId.wireModelId(
-                params.model.modelId,
-                reasoning: params.reasoningLevel,
-                variants: IOSAntigravityModelVariants.effortsByBase
-            )
-            let wrapper = IOSGeminiPayloadBuilder.makeCloudCodeAssistWrapper(
-                modelId: wireModelId,
-                projectId: token.projectId,
-                inner: inner
-            )
-            url = target
-            request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue(IOSAntigravityOAuthConstants.userAgent, forHTTPHeaderField: "User-Agent")
-            request.setValue(IOSAntigravityOAuthConstants.clientMetadata, forHTTPHeaderField: "Client-Metadata")
-            request.httpBody = try await Self.encodeJSONOffMainActor(wrapper)
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            Self.applyCustomHeaders(params.customHeaders, to: &request)
-            request.setValue("Bearer \(token.accessToken)", forHTTPHeaderField: "Authorization")
-        } else {
-            guard provider.authMode == GoogleAuthMode.apiKey else {
-                throw IOSGeminiError.unsupportedAuthMode(String(describing: provider.authMode))
-            }
-            let accessKey = provider.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !accessKey.isEmpty else { throw IOSGeminiError.missingAPIKey }
-            let base = provider.baseUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            guard let target = URL(string: base + "/models/\(params.model.modelId):streamGenerateContent?alt=sse") else {
-                throw IOSGeminiError.stream("Gemini 请求地址无效。")
-            }
-            url = target
-            request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.httpBody = try await Self.encodeJSONOffMainActor(inner)
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            Self.applyCustomHeaders(params.customHeaders, to: &request)
-            request.setValue(accessKey, forHTTPHeaderField: "x-goog-api-key")
+        let inner = IOSGeminiPayloadBuilder.makeBody(messages: messages, params: params)
+        let wireModelId = params.model.modelId
+        guard provider.authMode == GoogleAuthMode.apiKey else {
+            throw IOSGeminiError.unsupportedAuthMode(String(describing: provider.authMode))
         }
+        let accessKey = provider.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !accessKey.isEmpty else { throw IOSGeminiError.missingAPIKey }
+        let base = provider.baseUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard let url = URL(string: base + "/models/\(params.model.modelId):streamGenerateContent?alt=sse") else {
+            throw IOSGeminiError.stream("Gemini 请求地址无效。")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = try await Self.encodeJSONOffMainActor(inner)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        Self.applyCustomHeaders(params.customHeaders, to: &request)
+        request.setValue(accessKey, forHTTPHeaderField: "x-goog-api-key")
         return (request, wireModelId)
     }
 
@@ -1056,20 +732,6 @@ final class IOSGeminiClient {
         }
     }
 
-    private func resolveOAuthSessionToken() async throws -> (accessToken: String, projectId: String) {
-        guard IOSAntigravityAuthStore.load(providerId: IOSGeminiProviderResolver.providerKey(provider)) != nil else {
-            throw IOSGeminiError.notSignedIn
-        }
-        let client = IOSAntigravityOAuthClients.shared(providerId: IOSGeminiProviderResolver.providerKey(provider))
-        // Fresh token first; ensureOnboarded is idempotent and returns the cached
-        // token record (which may be stale), so use the refreshed value here.
-        let accessToken = try await client.getValidAccessToken()
-        let onboarded = try await client.ensureOnboarded()
-        guard let projectId = onboarded.projectId, !projectId.isEmpty else {
-            throw IOSGeminiError.stream("Antigravity 账号尚未完成 Gemini 接入，请稍后重试。")
-        }
-        return (accessToken, projectId)
-    }
 
     // MARK: chunk helpers
 

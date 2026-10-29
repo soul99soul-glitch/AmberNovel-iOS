@@ -158,15 +158,8 @@ public enum IOSSharedKmpProviders {
 /// `OpenAIKmpProvider` or `ClaudeKmpProvider` based on the provider's sealed
 /// type, so sub-agents/councils can run on either protocol.
 public struct OpenAIKmpProviderAdapter: IOSAgentTextProvider, IOSAgentStreamingProvider {
-    typealias GrokGenerator = @Sendable (
-        ProviderSetting.OpenAI,
-        [UIMessage],
-        TextGenerationParams
-    ) async throws -> MessageChunk
-
     private let openAIProvider: OpenAIKmpProvider
     private let claudeProvider: ClaudeKmpProvider
-    private let grokGenerator: GrokGenerator
 
     public init(
         openAIProvider: OpenAIKmpProvider = IOSSharedKmpProviders.openAI,
@@ -174,23 +167,6 @@ public struct OpenAIKmpProviderAdapter: IOSAgentTextProvider, IOSAgentStreamingP
     ) {
         self.openAIProvider = openAIProvider
         self.claudeProvider = claudeProvider
-        self.grokGenerator = { provider, messages, params in
-            try await Self.generateGrokText(
-                providerSetting: provider,
-                messages: messages,
-                params: params
-            )
-        }
-    }
-
-    init(
-        openAIProvider: OpenAIKmpProvider = IOSSharedKmpProviders.openAI,
-        claudeProvider: ClaudeKmpProvider = IOSSharedKmpProviders.claude,
-        grokGenerator: @escaping GrokGenerator
-    ) {
-        self.openAIProvider = openAIProvider
-        self.claudeProvider = claudeProvider
-        self.grokGenerator = grokGenerator
     }
 
     public func generateText(
@@ -198,20 +174,9 @@ public struct OpenAIKmpProviderAdapter: IOSAgentTextProvider, IOSAgentStreamingP
         messages: [UIMessage],
         params: TextGenerationParams
     ) async throws -> MessageChunk {
-        let resolvedProvider = try await IOSGrokWebProviderResolver.resolved(
-            try await IOSCodexProviderResolver.resolved(providerSetting)
-        )
-        let resolvedParams = IOSGrokWebProviderResolver.augmentParamsForGrok(
-            IOSCodexProviderResolver.augmentParamsForCodex(
-                params,
-                provider: resolvedProvider
-            ),
-            provider: resolvedProvider
-        )
-        if let openAI = resolvedProvider as? ProviderSetting.OpenAI,
-           IOSGrokWebProviderResolver.isGrokWebConfiguration(openAI) {
-            return try await grokGenerator(openAI, messages, params)
-        }
+        try Self.rejectLegacyAccountLogin(providerSetting)
+        let resolvedProvider = providerSetting
+        let resolvedParams = params
         if let openAI = resolvedProvider as? ProviderSetting.OpenAI {
             return try await openAIProvider.generateText(
                 providerSetting: openAI,
@@ -247,23 +212,15 @@ public struct OpenAIKmpProviderAdapter: IOSAgentTextProvider, IOSAgentStreamingP
         providerSetting: ProviderSetting,
         params: TextGenerationParams
     ) async throws -> (ProviderSetting, TextGenerationParams) {
-        let resolvedProvider = try await IOSGrokWebProviderResolver.resolved(
-            try await IOSCodexProviderResolver.resolved(providerSetting)
-        )
-        let resolvedParams = IOSGrokWebProviderResolver.augmentParamsForGrok(
-            IOSCodexProviderResolver.augmentParamsForCodex(
-                params,
-                provider: resolvedProvider
-            ),
-            provider: resolvedProvider
-        )
+        try Self.rejectLegacyAccountLogin(providerSetting)
+        let resolvedProvider = providerSetting
+        let resolvedParams = params
         return (resolvedProvider, resolvedParams)
     }
 
     public func supportsStreaming(providerSetting: ProviderSetting) -> Bool {
         if providerSetting is ProviderSetting.Google { return false }
-        guard let openAI = providerSetting as? ProviderSetting.OpenAI else { return true }
-        return !IOSGrokWebProviderResolver.isGrokWebConfiguration(openAI)
+        return !IOSLegacyAccountLogin.isLegacyLogin(providerSetting)
     }
 
     public func streamText(
@@ -274,6 +231,10 @@ public struct OpenAIKmpProviderAdapter: IOSAgentTextProvider, IOSAgentStreamingP
         onComplete: @escaping @Sendable () -> Void,
         onError: @escaping @Sendable (KotlinThrowable) -> Void
     ) -> Kotlinx_coroutines_coreJob? {
+        if IOSLegacyAccountLogin.isLegacyLogin(providerSetting) {
+            onError(KotlinThrowable(message: Self.legacyAccountLoginMessage))
+            return nil
+        }
         if let openAI = providerSetting as? ProviderSetting.OpenAI {
             return openAIProvider.streamTextCancellable(
                 providerSetting: openAI, messages: messages, params: params,
@@ -297,47 +258,14 @@ public struct OpenAIKmpProviderAdapter: IOSAgentTextProvider, IOSAgentStreamingP
         return "当前服务商类型暂不支持子代理"
     }
 
-    private static func generateGrokText(
-        providerSetting: ProviderSetting.OpenAI,
-        messages: [UIMessage],
-        params: TextGenerationParams
-    ) async throws -> MessageChunk {
-        let prompt = messages.compactMap { message -> String? in
-            let text = message.parts.compactMap { part in
-                (part as? UIMessagePart.Text)?.text
-            }
-            .joined(separator: "\n")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { return nil }
-            return "[\(String(describing: message.role).lowercased())]\n\(text)"
-        }
-        .joined(separator: "\n\n")
-        let text = try await IOSGrokWebClient(
-            providerId: IOSGrokWebProviderResolver.providerKey(providerSetting)
-        ).generateText(prompt: prompt, modelId: params.model.modelId)
-        let message = UIMessage(
-            id: KotlinUuid.companion.random(),
-            role: MessageRole.assistant,
-            parts: [UIMessagePart.Text(text: text, metadata: nil)],
-            annotations: [],
-            createdAt: chatNowLocalDateTime(),
-            finishedAt: chatNowLocalDateTime(),
-            modelId: params.model.id,
-            usage: nil,
-            translation: nil
-        )
-        return MessageChunk(
-            id: "",
-            model: params.model.modelId,
-            choices: [
-                UIMessageChoice(
-                    index: 0,
-                    delta: nil,
-                    message: message,
-                    finishReason: "stop"
-                ),
-            ],
-            usage: nil
+    static let legacyAccountLoginMessage = "该服务商使用的账号登录方式已移除，请改用你自己的 API Key。"
+
+    private static func rejectLegacyAccountLogin(_ provider: ProviderSetting) throws {
+        guard IOSLegacyAccountLogin.isLegacyLogin(provider) else { return }
+        throw NSError(
+            domain: "AmberAgent.AgentToolEngine",
+            code: 2,
+            userInfo: [NSLocalizedDescriptionKey: legacyAccountLoginMessage]
         )
     }
 }
@@ -741,7 +669,6 @@ public final class IOSAgentToolEngine: @unchecked Sendable {
     private static let toolTerminalLedgerFailureMessage = "tool result ledger write failed"
 
     private enum PreparedStepMode {
-        case grokWeb
         case gemini
         case blocking
         case streaming
@@ -760,10 +687,6 @@ public final class IOSAgentToolEngine: @unchecked Sendable {
         providerSetting: ProviderSetting,
         params: TextGenerationParams
     ) async throws -> PreparedStepRequest {
-        if let openAI = providerSetting as? ProviderSetting.OpenAI,
-           IOSGrokWebProviderResolver.isGrokWebConfiguration(openAI) {
-            return PreparedStepRequest(providerSetting: providerSetting, params: params, mode: .grokWeb)
-        }
         if let google = providerSetting as? ProviderSetting.Google,
            IOSGeminiProviderResolver.supportsChat(google) {
             return PreparedStepRequest(providerSetting: providerSetting, params: params, mode: .gemini)
@@ -818,20 +741,6 @@ public final class IOSAgentToolEngine: @unchecked Sendable {
         // ordinary system/user text is never treated as an authorization source.
         citationTracker?.allowCitationIds(from: messages)
         switch request.mode {
-        case .grokWeb:
-            guard let openAI = request.providerSetting as? ProviderSetting.OpenAI else {
-                throw NSError(domain: "IOSAgentToolEngine.PreparedRequest", code: 1)
-            }
-            return try await streamGrokWebStep(
-                provider: openAI,
-                messages: messages,
-                params: request.params,
-                citationTracker: citationTracker,
-                onAssistantStage: onAssistantStage,
-                onAssistantText: onAssistantText,
-                onAssistantReasoning: onAssistantReasoning,
-                onAssistantMessageSnapshot: onAssistantMessageSnapshot
-            )
         case .gemini:
             guard let google = request.providerSetting as? ProviderSetting.Google else {
                 throw NSError(domain: "IOSAgentToolEngine.PreparedRequest", code: 2)
@@ -951,81 +860,6 @@ public final class IOSAgentToolEngine: @unchecked Sendable {
             state.cancel()
             throw StreamStepFailure(underlying: error, assistant: state.assistantSnapshot())
         }
-    }
-
-    private func streamGrokWebStep(
-        provider: ProviderSetting.OpenAI,
-        messages: [UIMessage],
-        params: TextGenerationParams,
-        citationTracker: IOSMemoryCitationTracker?,
-        onAssistantStage: (@Sendable (AgentActivityStage) -> Void)?,
-        onAssistantText: (@Sendable (String) -> Void)?,
-        onAssistantReasoning: (@Sendable (String) -> Void)?,
-        onAssistantMessageSnapshot: (@Sendable (UIMessage) -> Void)?
-    ) async throws -> MessageChunk {
-        let seed = UIMessage(
-            id: KotlinUuid.companion.random(),
-            role: MessageRole.user,
-            parts: [],
-            annotations: [],
-            createdAt: Self.nowLocalDateTime(),
-            finishedAt: nil,
-            modelId: nil,
-            usage: nil,
-            translation: nil
-        )
-        let state = StreamStepState(
-            accumulator: MessageStreamAccumulator(initialMessages: [seed], model: nil)
-        )
-        let collectAssistantText = onAssistantText != nil
-        let collectAssistantReasoning = onAssistantReasoning != nil
-        let boxed = UncheckedUIMessageBox(messages)
-        let task = Task { @MainActor in
-            try await IOSGrokWebClient(
-                providerId: IOSGrokWebProviderResolver.providerKey(provider)
-            ).streamText(messages: boxed.value, params: params) { chunk in
-                let strippedChunk = citationTracker?.stripped(chunk) ?? chunk
-                guard state.append(strippedChunk) else { return }
-                let update = state.appendAssistantDelta(
-                    from: strippedChunk,
-                    collectText: collectAssistantText,
-                    collectReasoning: collectAssistantReasoning
-                )
-                if let stage = update.stage { onAssistantStage?(stage) }
-                if let reasoning = update.reasoning { onAssistantReasoning?(reasoning) }
-                if let text = update.text { onAssistantText?(text) }
-                Self.deliverAssistantSnapshotIfDue(
-                    state: state,
-                    hook: onAssistantMessageSnapshot
-                )
-            }
-        }
-        do {
-            try await withTaskCancellationHandler {
-                try await task.value
-            } onCancel: {
-                state.cancel()
-                task.cancel()
-            }
-        } catch {
-            state.cancel()
-            throw StreamStepFailure(underlying: error, assistant: state.assistantSnapshot())
-        }
-        let last = state.assistantSnapshot()
-        let finalMessage: UIMessage = last?.role == MessageRole.assistant
-            ? last!
-            : Self.emptyAssistant()
-        return MessageChunk(
-            id: "",
-            model: params.model.modelId,
-            choices: [UIMessageChoice(
-                index: 0,
-                delta: nil,
-                message: finalMessage,
-                finishReason: state.terminalFinishReason() ?? "stop"
-            )],
-            usage: nil
-        )
     }
 
     private func streamGeminiStep(

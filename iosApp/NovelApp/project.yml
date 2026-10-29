@@ -61,11 +61,8 @@ targets:
       - path: ../iosApp/HomePhosphorIcons.swift
       - path: ../iosApp/IOSAgentRunLedgerTypes.swift
       - path: ../iosApp/IOSAgentToolEngine.swift
-      - path: ../iosApp/IOSAntigravityOAuthClient.swift
       - path: ../iosApp/IOSAppLanguage.swift
       - path: ../iosApp/IOSBackgroundLifecycleLog.swift
-      - path: ../iosApp/IOSCodexOAuthClient.swift
-      - path: ../iosApp/IOSCodexProviderResolver.swift
       - path: ../iosApp/IOSCredentialRedactor.swift
       - path: ../iosApp/IOSCredentialSideTable.swift
       - path: ../iosApp/IOSDeepReadEditorialRenderer.swift
@@ -80,9 +77,8 @@ targets:
       - path: ../iosApp/IOSGenerativeWidgetRenderer.swift
       - path: ../iosApp/IOSGenerativeWidgetSanitizer.swift
       - path: ../iosApp/IOSGoogleWebViewSearch.swift
-      - path: ../iosApp/IOSGrokOAuthClient.swift
-      - path: ../iosApp/IOSGrokWebProvider.swift
       - path: ../iosApp/IOSJevRunSummary.swift
+      - path: ../iosApp/IOSLegacyAccountLogin.swift
       - path: ../iosApp/IOSMemoryCitationStripper.swift
       - path: ../iosApp/IOSProviderConfigToolCatalog.swift
       - path: ../iosApp/IOSProviderRequestHeaders.swift

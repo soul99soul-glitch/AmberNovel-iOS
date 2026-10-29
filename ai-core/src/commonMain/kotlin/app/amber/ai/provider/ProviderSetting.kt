@@ -195,7 +195,6 @@ const val LEGACY_MIMO_API_DEFAULT_BASE_URL: String = "https://api.xiaomi.com/v1"
  */
 object OpenAICompatUserAgents {
     const val OPENCODE = "opencode/1.18.18"
-    const val CLAUDE_CODE = "claude-cli/1.0.85"
     const val CURSOR = "Cursor/1.7.52"
     const val CLINE = "cline/3.18.0"
 }

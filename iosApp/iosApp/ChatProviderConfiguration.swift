@@ -35,9 +35,6 @@ enum ChatConfigurationIssue: Equatable {
     case missingProvider
     case providerDisabled
     case unsupportedProvider
-    case codexNotSignedIn
-    case grokNotSignedIn
-    case geminiNotSignedIn
 
     var title: String {
         switch self {
@@ -53,12 +50,6 @@ enum ChatConfigurationIssue: Equatable {
             "服务商已停用"
         case .unsupportedProvider:
             "当前服务商暂不支持聊天"
-        case .codexNotSignedIn:
-            "还没有登录 Codex"
-        case .grokNotSignedIn:
-            "还没有登录 Grok"
-        case .geminiNotSignedIn:
-            "还没有登录 Antigravity"
         }
     }
 
@@ -76,12 +67,6 @@ enum ChatConfigurationIssue: Equatable {
             "请先在服务商设置里启用当前服务商，再发送消息。"
         case .unsupportedProvider:
             "当前服务商类型的 iOS 聊天执行器尚未移植，请先切换到 OpenAI 兼容或 Anthropic 服务商。"
-        case .codexNotSignedIn:
-            "请先在服务商设置里用 ChatGPT 账号登录 Codex，再发送消息。"
-        case .grokNotSignedIn:
-            "请先在 xAI 服务商设置里用 Grok 账号登录，再发送消息。"
-        case .geminiNotSignedIn:
-            "请先在 Gemini 服务商设置里用 Google 账号登录 Antigravity，再发送消息。"
         }
     }
 }
@@ -105,25 +90,16 @@ enum ChatProviderConfiguration {
     static func issue(for model: Model, provider: ProviderSetting?) -> ChatConfigurationIssue? {
         guard let provider else { return .missingProvider }
         guard provider.enabled else { return .providerDisabled }
-        guard supportsChatStreaming(provider) else { return .unsupportedProvider }
-        // Codex OAuth providers carry no apiKey — the bearer is an OAuth token
-        // resolved at request time. Gate on sign-in state instead of apiKey.
-        if IOSCodexProviderResolver.isCodexProvider(provider) {
-            if !IOSCodexProviderResolver.isSignedIn(provider) { return .codexNotSignedIn }
-            if model.modelId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return .missingModel }
-            return nil
-        }
-        if IOSGrokWebProviderResolver.isGrokWebProvider(provider) {
-            if !IOSGrokWebProviderResolver.isSignedIn(provider) { return .grokNotSignedIn }
-            if model.modelId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return .missingModel }
-            return nil
-        }
+        // Google sign-in (Antigravity) was removed on iOS. A provider still saved
+        // in that mode reads as not configured and points at the user's own API key.
         if let google = provider as? ProviderSetting.Google,
            IOSGeminiProviderResolver.isAntigravityOAuth(google) {
-            if !IOSGeminiProviderResolver.isSignedIn(provider) { return .geminiNotSignedIn }
-            if model.modelId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return .missingModel }
-            return nil
+            return .missingAPIKey
         }
+        // Codex / Grok account sign-in was removed on iOS. A provider still saved
+        // in that mode reads as not configured and points at the user's own API key.
+        if IOSLegacyAccountLogin.isLegacyLogin(provider) { return .missingAPIKey }
+        guard supportsChatStreaming(provider) else { return .unsupportedProvider }
         return issue(
             baseUrl: baseURL(of: provider),
             apiKey: apiKey(of: provider),
@@ -149,9 +125,9 @@ enum ChatProviderConfiguration {
         // chat completions, and Responses. Credentials/endpoints are checked separately.
         if provider is ProviderSetting.OpenAI { return true }
         if let google = provider as? ProviderSetting.Google {
-            // Native Swift Gemini transport: API Key (non-Vertex) or Antigravity
-            // OAuth. Vertex/service-account and the Android-only Code Assist
-            // OAuth mode are not implemented on iOS.
+            // Native Swift Gemini transport: API Key (non-Vertex) only.
+            // Legacy Antigravity, Vertex/service-account and the Android-only
+            // Code Assist OAuth mode are not implemented on iOS.
             return IOSGeminiProviderResolver.supportsChat(google)
         }
         return provider is ProviderSetting.Claude
@@ -168,35 +144,17 @@ enum ChatProviderConfiguration {
         return ""
     }
 
-    /// List-row / chat-ready credential: API key, or a signed-in OAuth/Web session.
+    /// List-row / chat-ready credential: a non-empty API key.
     static func hasUsableCredential(_ provider: ProviderSetting) -> Bool {
-        if IOSCodexProviderResolver.isCodexProvider(provider) {
-            return IOSCodexProviderResolver.isSignedIn(provider)
-        }
-        if IOSGrokWebProviderResolver.isGrokWebProvider(provider) {
-            return IOSGrokWebProviderResolver.isSignedIn(provider)
-        }
+        if IOSLegacyAccountLogin.isLegacyLogin(provider) { return false }
         if let google = provider as? ProviderSetting.Google,
            IOSGeminiProviderResolver.isAntigravityOAuth(google) {
-            return IOSGeminiProviderResolver.isSignedIn(provider)
+            return false
         }
         return !apiKey(of: provider).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     static func credentialStatusTitle(_ provider: ProviderSetting) -> String {
-        if IOSCodexProviderResolver.isCodexProvider(provider),
-           IOSCodexProviderResolver.isSignedIn(provider) {
-            return "已登录"
-        }
-        if IOSGrokWebProviderResolver.isGrokWebProvider(provider),
-           IOSGrokWebProviderResolver.isSignedIn(provider) {
-            return "已登录"
-        }
-        if let google = provider as? ProviderSetting.Google,
-           IOSGeminiProviderResolver.isAntigravityOAuth(google),
-           IOSGeminiProviderResolver.isSignedIn(provider) {
-            return "已登录"
-        }
         return hasUsableCredential(provider) ? "已配置" : "未填写"
     }
 
